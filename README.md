@@ -5,9 +5,16 @@
 A floating status bar for Sway. Replaces `swaybar`. Binary: `swbr`.
 
 It sits on the layer shell above the tiled windows, flush with the top edge.
-Hover it, press space, and it rolls up into a 4px signal strip.
+Hover it, press space, and it rolls up into a 5px signal strip.
 
-Version: **0.8.0**
+![SwBr](screenshot.png)
+
+Folded: workspace slots, twelve clock dots, gauges — still readable, still
+clickable.
+
+![SwBr folded](screenshot-slim.png)
+
+Version: **0.8.1**
 
 ## Why not swaybar
 
@@ -89,6 +96,7 @@ cpu.button1=foot -e htop    # click it
 | `pad` | padding inside the cell |
 | `slim` | folded strip: `auto`, `tick`, `bar`, `clock`, `off` |
 | `slim_min` `slim_max` | value range a gauge maps |
+| `slim_w` | width in the folded strip |
 | `markup` | `<span foreground="#rrggbb">` inside the output |
 | `button1..9` | per-cell click commands |
 | `pos` | `left`, `center` or `right` group |
@@ -192,9 +200,13 @@ Per cell: `slim=auto|tick|bar|clock|off`, plus `slim_min`/`slim_max`.
 Height is `collapsed_px` (5 by default).
 
 The strip stays **clickable**: workspace slots still switch workspaces, and a
-cell's button bindings still fire. Give a media cell `slim=tick` and it keeps
-working as a play/pause button while folded — the screen edge makes a 5px
-target easy to hit. Start folded with `swbr --slim`.
+cell's button bindings still fire. Give a media cell `slim=tick` (not `off`)
+and `slim_w=26`, and it stays on the strip as a play/pause button you can
+find and hit — the screen edge makes a 5px target easy.
+
+For something you must be able to reach without aiming, use the bar-wide
+`button2=` / `button6=` / `button7=` bindings: they fire anywhere no cell
+sits, folded or not. Start folded with `swbr --slim`.
 
 Elements sit in the same order as the expanded bar, and cells glued in the
 layout stay glued here too. `swbr --probe` prints the whole strip left to
@@ -219,7 +231,7 @@ swbr --dump-config   # a config file with every default
 swbr --probe         # outputs, sizes, font metrics, live cell values
 swbr --msg TEXT      # send a message to the running bar
 swbr --slim          # start folded
-swbr --version       # SwBr 0.8.0 (build 78ea5bfe)  <- md5 of swbr.c
+swbr --version       # SwBr 0.8.1 (build eaebdc09)  <- md5 of swbr.c
 ```
 
 See `swbr_config.example` for the commented version.
@@ -248,6 +260,10 @@ See `swbr_config.example` for the commented version.
 - Media glyphs checked against the font before shipping them: `U+23F8` and
   the rest of that block are missing from DejaVu, so the config uses glyphs
   that exist.
+- The folded paint path is now the same code the compositor gets, run
+  headless in tests: the music button lands at 582..608 in its own colour
+  with its binding attached, and a middle click anywhere else falls through
+  to the bar-wide binding.
 - Self-sizing checked across states: 800px idle, 1217px with charging, temp
   and a docker list, and capped at the 1920px screen when content overflows.
 - Folded strip rendered and sampled pixel by pixel: workspace slots, clock

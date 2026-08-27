@@ -68,7 +68,7 @@
 #include <unistd.h>
 
 #define APP_ID          "swbr"
-#define SWBR_VERSION  "0.8.0"
+#define SWBR_VERSION  "0.8.1"
 #ifndef SWBR_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWBR_BUILD "unknown"
 #endif
@@ -779,6 +779,7 @@ typedef struct {
     int   pad;                   /* inner padding, left and right */
     int   slim;                  /* how it shows in the folded strip */
     float slim_min, slim_max;    /* value range a gauge maps, default 0..100 */
+    int   slim_w;                /* custom width in the folded strip */
     Col   color, bg;
     bool  has_color, has_bg;
     Col   warn_col, crit_col;
@@ -978,6 +979,7 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
     else if (!strcmp(k, "pad")) e->pad = atoi(v);
     else if (!strcmp(k, "slim_min")) e->slim_min = (float)atof(v);
     else if (!strcmp(k, "slim_max")) e->slim_max = (float)atof(v);
+    else if (!strcmp(k, "slim_w")) e->slim_w = atoi(v);
     else if (!strcmp(k, "slim")) {
         if (!strcasecmp(v, "bar")) e->slim = SLIM_BAR;
         else if (!strcasecmp(v, "clock")) e->slim = SLIM_CLOCK;
@@ -2333,8 +2335,9 @@ static int slim_mode(Cell *e)
     return SLIM_TICK;
 }
 
-static float slim_width(int mode, float s)
+static float slim_width_of(Cell *e, int mode, float s)
 {
+    if (e && e->slim_w > 0) return (float)e->slim_w * s;
     switch (mode) {
     case SLIM_CLOCK: return 12.0f * 3.0f * s + 11.0f * 2.0f * s;
     case SLIM_BAR:   return 40.0f * s;
@@ -2342,6 +2345,7 @@ static float slim_width(int mode, float s)
     default:         return 12.0f * s;
     }
 }
+
 
 static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
                           float w, float h, float s)
@@ -2446,13 +2450,13 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
         idx[n] = it->cell;
         mode[n] = m;
         join[n] = (n > 0 && !layout_item[G_RIGHT][i - 1].sep);
-        total += slim_width(m, s) + (n ? (join[n] ? 1.0f * s : gap) : 0);
+        total += slim_width_of(e, m, s) + (n ? (join[n] ? 1.0f * s : gap) : 0);
         n++;
     }
     float rx = (float)cv->w - 4.0f * s - total;
     if (rx < x + gap) rx = x + gap;
     for (int k = 0; k < n; ++k) {
-        float w = slim_width(mode[k], s);
+        float w = slim_width_of(&cfg.cell[idx[k]], mode[k], s);
         if (k) rx += join[k] ? 1.0f * s : gap;
         if (rx + w > (float)cv->w - 3.0f * s) break;
         slim_draw_one(cv, &cfg.cell[idx[k]], mode[k], rx, y, w, h, s);
@@ -2880,6 +2884,66 @@ static void bar_fit_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
     }
 }
 
+/* Everything the bar paints, into a plain canvas. Split out of bar_render so
+ * it can be exercised without a compositor. */
+static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
+{
+    bool top = strcmp(cfg.position, "bottom") != 0;
+    float vis = visL * s;
+    float y0 = top ? 0.0f : (float)cv->h - vis;
+    float rad = cfg.radius * s;
+    float bw = (float)cv->w;
+
+    memset(cv->px, 0, (size_t)cv->w * (size_t)cv->h * 4);
+    canvas_clip_all(cv);
+
+    /* flush with the screen edge: the two corners that touch it stay square */
+    if (top) fill_round(cv, 0, y0, bw, vis, 0, 0, rad, rad, cfg.bg);
+    else     fill_round(cv, 0, y0, bw, vis, rad, rad, 0, 0, cfg.bg);
+
+    Runs rs;
+    markup_parse(status_line, &rs, cfg.text);
+
+    float fade = clampf(b->vis * 1.6f - 0.25f, 0.0f, 1.0f);
+    b->hits = 0;
+    b->chits = 0;
+    if (fade <= 0.01f) {
+        draw_signals(cv, b, y0, vis, s, &rs);
+        return;
+    }
+
+    canvas_clip(cv, 0, (int)floorf(y0), (int)bw, (int)ceilf(y0 + vis));
+
+    Font *f = font_get((int)lroundf(cfg.text_px * cfg.ui_scale * s));
+    bar_fit_width(b, cv, f, vis, s);
+    float gap = (float)cfg.cell_gap * s;
+    float left_limit = (float)cfg.pad_x * s;
+    float right = bw - (float)(cfg.pad_right >= 0 ? cfg.pad_right : cfg.pad_x) * s;
+
+    if (cfg.cell_count || layout_n[G_LEFT]) {
+        float lw = group_width(cv, b, f, G_LEFT, vis, s);
+        float after_left = left_limit + (lw > 0 ? lw + gap : 0.0f);
+        float rx = draw_group(cv, b, f, G_RIGHT, y0, vis, s, fade, after_left, right);
+        float mx = draw_message(cv, b, f, y0, vis, s, fade, after_left, rx - gap);
+        float cx = draw_group(cv, b, f, G_CENTER, y0, vis, s, fade, after_left,
+                              fminf(rx, mx) - gap);
+        draw_group(cv, b, f, G_LEFT, y0, vis, s, fade, left_limit, cx - gap);
+    }
+
+    if (!cfg.cell_count && *status_line) {         /* status_command fallback */
+        float total = 0;
+        for (int i = 0; i < rs.n; ++i) total += text_width(f, rs.v[i].text);
+        float sx = right - total;
+        float base = baseline_for(f, y0, vis, s);
+        for (int i = 0; i < rs.n; ++i) {
+            float rw = text_width(f, rs.v[i].text);
+            text_draw(cv, f, sx, base, col_scale_alpha(rs.v[i].fg, fade), rs.v[i].text);
+            sx += rw;
+        }
+    }
+    canvas_clip_all(cv);
+}
+
 static void bar_render(Bar *b)
 {
     if (!b->configured || b->closed) return;
@@ -2890,68 +2954,12 @@ static void bar_render(Bar *b)
     if (slot < 0) return;                     /* both in flight: next frame */
 
     float s = (float)b->scale;
-    Canvas cv = { (uint32_t *)b->bufmem[slot], b->bw, b->bh, 0, 0, b->bw, b->bh };
-    memset(cv.px, 0, (size_t)b->stride * (size_t)b->bh);
-    canvas_clip_all(&cv);
-
-    bool top = strcmp(cfg.position, "bottom") != 0;
     float visL = bar_visible_logical(b);
-    float vis = visL * s;
-    float y0 = top ? 0.0f : (float)b->bh - vis;
-    float rad = cfg.radius * s;
-    float bw = (float)b->bw;
+    bool top = strcmp(cfg.position, "bottom") != 0;
+    Canvas cv = { (uint32_t *)b->bufmem[slot], b->bw, b->bh, 0, 0, b->bw, b->bh };
+    bar_paint(b, &cv, visL, s);
 
-    /* flush with the screen edge: the two corners that touch it stay square */
-    if (top) fill_round(&cv, 0, y0, bw, vis, 0, 0, rad, rad, cfg.bg);
-    else     fill_round(&cv, 0, y0, bw, vis, rad, rad, 0, 0, cfg.bg);
-
-    Runs rs;
-    markup_parse(status_line, &rs, cfg.text);
-
-    float fade = clampf(b->vis * 1.6f - 0.25f, 0.0f, 1.0f);
-    if (fade <= 0.01f) {
-        draw_signals(&cv, b, y0, vis, s, &rs);
-        goto commit;
-    }
-
-    canvas_clip(&cv, 0, (int)floorf(y0), (int)bw, (int)ceilf(y0 + vis));
-
-    Font *f = font_get((int)lroundf(cfg.text_px * cfg.ui_scale * s));
-    Font *fws = font_get((int)lroundf(cfg.ws_px * cfg.ui_scale * s));
-    bar_fit_width(b, &cv, f, vis, s);
-    float gap = (float)cfg.cell_gap * s;
-    float left_limit = (float)cfg.pad_x * s;
-    float right = bw - (float)(cfg.pad_right >= 0 ? cfg.pad_right : cfg.pad_x) * s;
-
-    b->hits = 0;
-    b->chits = 0;
-
-    if (cfg.cell_count || layout_n[G_LEFT]) {
-        Font *gf = f;
-        (void)fws;
-        float lw = group_width(&cv, b, gf, G_LEFT, vis, s);
-        float after_left = left_limit + (lw > 0 ? lw + gap : 0.0f);
-        float rx = draw_group(&cv, b, gf, G_RIGHT, y0, vis, s, fade, after_left, right);
-        float mx = draw_message(&cv, b, gf, y0, vis, s, fade, after_left, rx - gap);
-        float cx = draw_group(&cv, b, gf, G_CENTER, y0, vis, s, fade, after_left,
-                              fminf(rx, mx) - gap);
-        draw_group(&cv, b, gf, G_LEFT, y0, vis, s, fade, left_limit, cx - gap);
-    }
-
-    if (!cfg.cell_count && *status_line) {         /* status_command fallback */
-        float total = 0;
-        for (int i = 0; i < rs.n; ++i) total += text_width(f, rs.v[i].text);
-        float sx = right - total;
-        float base = baseline_for(f, y0, vis, s);
-        for (int i = 0; i < rs.n; ++i) {
-            float rw = text_width(f, rs.v[i].text);
-            text_draw(&cv, f, sx, base, col_scale_alpha(rs.v[i].fg, fade), rs.v[i].text);
-            sx += rw;
-        }
-    }
-    canvas_clip_all(&cv);
-
-commit:
+    /* hand the buffer over */
     b->busy[slot] = true;
     wl_surface_set_buffer_scale(b->surf, b->scale);
     wl_surface_attach(b->surf, b->buf[slot], 0, 0);
@@ -3471,6 +3479,7 @@ static void usage(void)
 "  NAME.pad=0          padding inside the cell, left and right\n"
 "  NAME.slim=auto      folded strip: auto | tick | bar | clock | off\n"
 "  NAME.slim_min=0 NAME.slim_max=100   the range a gauge maps\n"
+"  NAME.slim_w=0       width in the folded strip, 0 = the mode's default\n"
 "  NAME.markup=1       parse pango markup in this cell's output\n"
 "  NAME.button1=CMD    click this cell\n"
 "  cell_gap=14 cell_inset=3 cell_radius=5\n"
@@ -3640,7 +3649,7 @@ static void probe_report(void)
         const char *mn = m == SLIM_BAR ? "gauge" : m == SLIM_CLOCK ? "clock"
                        : m == SLIM_OFF ? "off" : "tick";
         printf("  %-10s %-5s %3.0fpx %02x%02x%02x", e->name, mn,
-               (double)slim_width(m, 1.0f), c.r, c.g, c.b);
+               (double)slim_width_of(e, m, 1.0f), c.r, c.g, c.b);
         if (m == SLIM_BAR && have)
             printf("  %.1f of %g..%g = %.0f%% full",
                    (double)v, (double)e->slim_min, (double)e->slim_max,

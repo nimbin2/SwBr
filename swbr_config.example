@@ -141,7 +141,9 @@ cmusui.pad=4
 cmusui.bg=ffffff14
 cmusui.color=e8b81a    # a touch brighter than cb9b00: small glyph on a dark
                        # panel reads darker than a big filled workspace block
-cmusui.slim=tick   # stays on the folded strip as a button you can click
+cmusui.slim=tick   # stays on the folded strip as a button you can click.
+                   # If yours says slim=off you get no music block there.
+cmusui.slim_w=26   # wider than the other ticks, so it is easy to find and hit
 cmusui.button1=pgrep -x cmus >/dev/null && cmus_control toggle || foot -e cmus
 cmusui.button2=cmus_control toggle
 cmusui.button4=cmus_control prev
@@ -224,8 +226,13 @@ slim_ws_slots=10   # at most this many workspace slots
 start_collapsed=0  # 1 = start folded. Command line: swbr --slim
 # folds or unfolds every bar without the mouse:  pkill -USR1 swbr
 
-# --- mouse (anywhere on the bar; cell bindings win) ------------------------
-# button2=cmus_control toggle
+# --- mouse: anywhere on the bar, folded or not ------------------------------
+# Cell bindings win where a cell is; these catch everywhere else, which is the
+# reliable way to control music while the bar is folded down to a few pixels.
+# Same buttons your old sway bar block used.
+button2=cmus_control toggle
+button6=cmus_control prev
+button7=cmus_control next
 
 # ---------------------------------------------------------------------------
 # LAYOUT — one line that places everything. Keep it last: it assigns group,

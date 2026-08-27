@@ -80,7 +80,13 @@ scroll_pause=900   # ms held at each end before scrolling
 #   NAME.gap=          space after this cell, overrides cell_gap. 0 glues it
 #                      to the next one: equal bg colours merge into one box
 #   NAME.pad=0         padding inside the cell, left and right
-#   NAME.slim=auto     folded strip: auto | tick | bar | clock | off
+#   NAME.slim=auto     folded strip: auto | tick | bar | clock | presence |
+#                      off. presence = a plain block in the running colour,
+#                      present only while the program is
+#   NAME.slim_color=   override this cell's colour on the strip. Without it
+#                      the strip reuses the colour the cell's own text has,
+#                      so a cyan clock stays cyan when folded
+#   NAME.slim_color2=  second colour: the minutes of a clock cell
 #   NAME.slim_min=0    the value range a gauge maps, so a temperature or a
 #   NAME.slim_max=100  load average can be a gauge as well as a percent
 #   NAME.markup=1      the output may use <span foreground="#rrggbb">..</span>
@@ -132,17 +138,22 @@ cmus.button4=cmus_control prev
 cmus.button5=cmus_control next
 
 cell=cmusui
-cmusui.cmd=pgrep -x cmus >/dev/null || exit 0; case "$(cmus_control status 2>/dev/null)" in playing) printf '❚❚';; paused) printf '▶';; stopped) printf '■';; *) printf '▶';; esac
+cmusui.cmd=pgrep -x cmus >/dev/null || exit 0; case "$(cmus_control status 2>/dev/null)" in playing) printf '<span foreground="#2fbf71">❚❚</span>';; paused) printf '<span foreground="#e8b81a">▶</span>';; *) printf '<span foreground="#5a6b7a">■</span>';; esac
 cmusui.interval=2
 cmusui.empty=♪     # cmus not running: still a button, click it to start
 cmusui.min_w=38    # never shrinks, never truncates
 cmusui.align=center
 cmusui.pad=4
 cmusui.bg=ffffff14
-cmusui.color=e8b81a    # a touch brighter than cb9b00: small glyph on a dark
-                       # panel reads darker than a big filled workspace block
-cmusui.slim=tick   # stays on the folded strip as a button you can click.
-                   # If yours says slim=off you get no music block there.
+cmusui.color=e8b81a    # fallback; the command colours itself per state, and
+                       # the folded strip picks that colour up, so a green
+                       # block means playing and a grey one means stopped
+cmusui.slim=media  # folded: TWO bars while playing, one dim block when not.
+                   # A shape, not another coloured block among gauges.
+cmusui.slim_on=❚   # THIS is what tells it "playing": the output must contain
+                   # this text. It matches the ❚❚ printed above. If you change
+                   # the command to print your own icon, change this too, or
+                   # the strip will always show the idle block.
 cmusui.slim_w=26   # wider than the other ticks, so it is easy to find and hit
 cmusui.button1=pgrep -x cmus >/dev/null && cmus_control toggle || foot -e cmus
 cmusui.button2=cmus_control toggle
@@ -155,6 +166,7 @@ volume.cmd=alsa_control volume get
 volume.interval=2
 volume.button2=alsa_control mute toggle
 volume.slim=bar
+volume.slim_color=a9d8f5   # light baby blue, its own thing on the strip
 
 # --- docker and mpv share one group: docker.sep=0 joins them ---------------
 cell=docker
@@ -162,16 +174,34 @@ docker.cmd=pgrep -x dockerd >/dev/null || exit 0; docker ps --format '{{.Image}}
 docker.interval=10
 docker.color=19cb00
 docker.sep=0
+docker.slim=presence   # folded: a block in the running colour, there only
+                       # while dockerd is, so a glance says it is up
 
 cell=mpv
 mpv.cmd=pgrep -x mpv >/dev/null || exit 0; ws=$(swaymsg -t get_workspaces | jq -r '.[] | select(.representation != null) | select(.representation | test("mpv")) | .name' | paste -sd'|'); [ -n "$ws" ] && printf '<span foreground="#19cb00">mpv </span><span foreground="#3E98E7">[%s]</span>' "$ws" || printf '<span foreground="#cecb00">mpv</span>'
 mpv.interval=3
+mpv.slim=presence      # same for mpv: started something in the background?
+mpv.slim_color=3ea6ff  # its own colour, so you can tell the two apart
+
+# --- cmus, without a script ------------------------------------------------
+# swbr runs cmus-remote itself, so playing and paused are facts. It fills in
+# the command, the interval, slim=media and the mouse binds; override any of
+# them below if you want something else.
+# cell=music
+# music.source=cmus
+# music.cmus_fmt=%i %n   # %i icon, %n artist — title, %a, %t, %s playing|paused
+#                        # two cells work too: one with %i, one with %n
 
 # --- clock -----------------------------------------------------------------
 cell=clock
 clock.cmd=date '+<span foreground="#00ffff">%H:%M</span>  %a %d.%m'
 clock.interval=5
-clock.slim=clock   # twelve dots: hours lit, the current one grows with minutes
+clock.slim=clock   # twelve dots for the hour, in the same cyan the clock
+                   # uses in the full bar (taken from its own markup)
+clock.slim_color2=2f7f9f   # the minutes bar, and the morning hours. Every dot
+                   # up to the hour is lit, so you count bars: 2 at 02:00 and
+                   # still 2 at 02:55. Main colour after noon, this one
+                   # before, so 13:00 and 1:00 differ
 
 # --- cpu load and temperature, joined --------------------------------------
 cell=cpu
@@ -199,11 +229,14 @@ cell=power
 power.cmd=b=/sys/class/power_supply/BAT0; grep -q Discharging $b/status || exit 0; awk -v e="$(cat $b/energy_now)" -v p="$(cat $b/power_now)" 'BEGIN{if(p>0)printf "%.2fW %.1fh", p/1000000, e/p}'
 power.interval=10
 power.color=b3c0cd
+power.slim=off     # watts and hours say nothing as a bar
 power.sep=0
 
+# The marker at the end tells the folded strip which way it is going:
+# + charging, - discharging, = full. In the full bar it reads as ⚡ or nothing.
 cell=battery
-battery.cmd=cat /sys/class/power_supply/BAT0/capacity
-battery.fmt=%s%
+battery.cmd=b=/sys/class/power_supply/BAT0; c=$(cat $b/capacity); case "$(cat $b/status)" in Charging) printf '%s%%+' "$c";; Full) printf '%s%%=' "$c";; *) printf '%s%%-' "$c";; esac
+battery.markup=1
 battery.interval=10
 battery.color=e1eeff
 battery.warn=<30:cecb00
@@ -224,7 +257,9 @@ signals=1          # the folded strip still says something: every workspace
                    # with a percentage become little gauges
 slim_ws_slots=10   # at most this many workspace slots
 start_collapsed=0  # 1 = start folded. Command line: swbr --slim
-# folds or unfolds every bar without the mouse:  pkill -USR1 swbr
+# Without the mouse. Bind either one to a key in your sway config:
+#   bindsym $mod+b exec swbr --toggle      (also --fold / --unfold)
+#   bindsym $mod+b exec pkill -USR1 swbr
 
 # --- mouse: anywhere on the bar, folded or not ------------------------------
 # Cell bindings win where a cell is; these catch everywhere else, which is the
@@ -253,6 +288,17 @@ dim=5a6b7aff
 accent=89afc4ff     # visible-but-not-focused workspace tick
 hl=cb9b00ff         # focused workspace tick in the folded strip
 urgent=e0533cff
+ws_cpu=1           # a dot on each workspace button showing how much
+                   # processor time the windows on it are using. Folded, the
+                   # workspace slot fills from the bottom instead
+ws_cpu_interval=3  # seconds between samples
+ws_cpu_min=4       # below this much load nothing is drawn
+ws_cpu_full=60     # this much load paints it fully hot
+
+running=3ddc84ff   # folded strip: this program is up, and where a charging
+                   # gauge's pips ramp to
+slim_warm=e8963cff # where the direction pips start: orange into red while
+                   # draining, orange into green while charging
 ws_bg=00000000      # inactive button: nothing, the bar shows through
 ws_fg=b3c0cdff
 ws_focused_bg=cb9b00ff   # the appwheel orange

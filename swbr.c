@@ -46,6 +46,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
@@ -67,8 +68,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "sw_theme.h"
+
 #define APP_ID          "swbr"
-#define SWBR_VERSION  "0.8.1"
+#define SWBR_VERSION  "0.11.0"
 #ifndef SWBR_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWBR_BUILD "unknown"
 #endif
@@ -78,7 +81,8 @@
 #define MAX_BINDS       10
 #define MAX_CELLS       24
 
-enum { SLIM_AUTO, SLIM_TICK, SLIM_BAR, SLIM_CLOCK, SLIM_OFF };
+enum { SLIM_AUTO, SLIM_TICK, SLIM_BAR, SLIM_CLOCK, SLIM_PRESENCE,
+       SLIM_MEDIA, SLIM_OFF };
 
 /* ------------------------------------------------------------------ util */
 
@@ -526,7 +530,8 @@ enum {
     IPC_RUN_COMMAND    = 0,
     IPC_GET_WORKSPACES = 1,
     IPC_SUBSCRIBE      = 2,
-    IPC_GET_OUTPUTS    = 3
+    IPC_GET_OUTPUTS    = 3,
+    IPC_GET_TREE       = 4
 };
 
 static int sway_fd = -1;      /* request socket */
@@ -765,21 +770,268 @@ static void ws_reload(bool full_names)
     jfree(r);
 }
 
+/* ------------------------------------------------------ cpu per workspace
+ *
+ * Who is working, and where. sway knows which pid each window belongs to and
+ * which workspace that window is on; /proc knows how much processor time each
+ * process has used. Put the two together and a workspace has a load.
+ *
+ * A process is credited to the nearest ancestor that owns a window, so a
+ * compiler started in a terminal counts towards the workspace that terminal
+ * is on. Anything with no window above it — daemons, the session itself —
+ * belongs to no workspace and is left out.
+ *
+ * swbr is the one that measures, because a rate needs two samples a few
+ * seconds apart and only a program that stays running has those. It writes
+ * the answer where swov can read it, so swov does not have to measure
+ * anything to draw the same numbers.
+ */
+
+typedef struct { int pid; int ws; } PidWs;      /* window pid -> ws_list index */
+
+static PidWs  cpu_win[512];
+static int    cpu_nwin;
+static double cpu_ws_pct[MAX_WORKSPACES];       /* by ws_list index */
+static char   cpu_ws_name[MAX_WORKSPACES][128];
+static int    cpu_ws_n;
+static double cpu_last_at;
+
+typedef struct {
+    int pid, ppid, ws;
+    unsigned long long own, chld;
+} ProcSample;
+static ProcSample *cpu_prev;
+static int         cpu_prev_n;
+
+typedef struct { int pid, ws; unsigned long long delta; } CpuTop;
+static CpuTop cpu_top[5];      /* the busiest of the last sample, for --probe */
+static int    cpu_top_n;
+
+/* own = this process's own cpu time, chld = the time of the children it has
+ * already reaped. The second one is what makes a build visible: every cc1
+ * lives for a moment and is gone long before the next sample, and its time
+ * lands in make's cutime rather than anywhere we could see it directly. */
+static bool proc_stat_of(int pid, int *ppid,
+                         unsigned long long *own, unsigned long long *chld)
+{
+    char path[64], buf[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[got] = 0;
+
+    char *close = strrchr(buf, ')');            /* comm can hold anything */
+    if (!close) return false;
+
+    unsigned long long ut = 0, st = 0;
+    long long cut = 0, cst = 0;
+    int pp = 0;
+    /* after "): state ppid pgrp session tty tpgid flags min_flt cmin_flt
+       maj_flt cmaj_flt utime stime cutime cstime" */
+    if (sscanf(close + 1, " %*c %d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu %lld %lld",
+               &pp, &ut, &st, &cut, &cst) != 5) return false;
+    if (cut < 0) cut = 0;
+    if (cst < 0) cst = 0;
+    *ppid = pp;
+    *own  = ut + st;
+    if (chld) *chld = (unsigned long long)(cut + cst);
+    return true;
+}
+
+static int cpu_ws_of_pid(int pid)
+{
+    for (int hop = 0; hop < 12 && pid > 1; ++hop) {
+        for (int i = 0; i < cpu_nwin; ++i)
+            if (cpu_win[i].pid == pid) return cpu_win[i].ws;
+        int ppid; unsigned long long own, chld;
+        if (!proc_stat_of(pid, &ppid, &own, &chld)) return -1;
+        pid = ppid;
+    }
+    return -1;
+}
+
+/* every view in sway's tree, as pid -> the workspace it sits on */
+static void cpu_collect_windows(const JV *node, int ws_idx)
+{
+    if (!node || node->type != J_OBJ) return;
+
+    const char *type = jstr(node, "type", "");
+    if (!strcmp(type, "workspace")) {
+        const char *name = jstr(node, "name", "");
+        ws_idx = -1;
+        for (int i = 0; i < ws_count; ++i)
+            if (!strcmp(ws_list[i].name, name)) { ws_idx = i; break; }
+    }
+    int pid = jint(node, "pid", -1);
+    if (pid > 0 && ws_idx >= 0 && cpu_nwin < (int)(sizeof cpu_win / sizeof *cpu_win)) {
+        cpu_win[cpu_nwin].pid = pid;
+        cpu_win[cpu_nwin].ws  = ws_idx;
+        cpu_nwin++;
+    }
+    for (int i = 0; i < node->count; ++i) {
+        JV *kid = node->items[i];
+        if (!kid) continue;
+        if (kid->type == J_ARR)
+            for (int j = 0; j < kid->count; ++j) cpu_collect_windows(kid->items[j], ws_idx);
+        else if (kid->type == J_OBJ)
+            cpu_collect_windows(kid, ws_idx);
+    }
+}
+
+static void cpu_write_cache(void)
+{
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    char path[512], tmp[540];
+    if (dir && *dir) snprintf(path, sizeof(path), "%s/swbr-cpu", dir);
+    else {
+        const char *home = getenv("HOME");
+        if (!home) return;
+        snprintf(path, sizeof(path), "%s/.cache/swbr-cpu", home);
+    }
+    snprintf(tmp, sizeof(tmp), "%s.new", path);
+
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < cpu_ws_n; ++i)
+        fprintf(f, "%s\t%.1f\n", cpu_ws_name[i], cpu_ws_pct[i]);
+    fclose(f);
+    if (rename(tmp, path) != 0) unlink(tmp);
+}
+
+/* one sample; the first call only records, the ones after it measure */
+static void cpu_sample(void)
+{
+    JV *tree = sway_query(IPC_GET_TREE);
+    if (!tree) return;
+    cpu_nwin = 0;
+    cpu_collect_windows(tree, -1);
+    jfree(tree);
+
+    DIR *d = opendir("/proc");
+    if (!d) return;
+
+    int cap = 1024, n = 0;
+    ProcSample *now = (ProcSample *)xmalloc((size_t)cap * sizeof *now);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        const char *p = e->d_name;
+        bool digits = *p != 0;
+        for (const char *q = p; *q; ++q) if (*q < '0' || *q > '9') { digits = false; break; }
+        if (!digits) continue;
+        if (n == cap) { cap *= 2; now = (ProcSample *)xrealloc(now, (size_t)cap * sizeof *now); }
+        int pid = atoi(p), ppid; unsigned long long own, chld;
+        if (!proc_stat_of(pid, &ppid, &own, &chld)) continue;
+        now[n].pid = pid; now[n].ppid = ppid;
+        now[n].own = own; now[n].chld = chld; now[n].ws = -1;
+        n++;
+    }
+    closedir(d);
+
+    double at = now_ms() / 1000.0;
+    double dt = at - cpu_last_at;
+
+    if (cpu_prev && dt > 0.2) {
+        long hz = sysconf(_SC_CLK_TCK);
+        if (hz <= 0) hz = 100;
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu <= 0) ncpu = 1;
+
+        double used[MAX_WORKSPACES] = { 0 };
+        cpu_top_n = 0;
+        for (int i = 0; i < n; ++i) {
+            const ProcSample *was = NULL;
+            for (int j = 0; j < cpu_prev_n; ++j)          /* same order, mostly */
+                if (cpu_prev[j].pid == now[i].pid) { was = &cpu_prev[j]; break; }
+
+            unsigned long long total = now[i].own + now[i].chld, before = 0;
+            if (was && was->own + was->chld <= total) before = was->own + was->chld;
+            /* no `was` means it was born inside this window, so all of its
+               time belongs to this window */
+            unsigned long long delta = total - before;
+
+            int ws = cpu_ws_of_pid(now[i].pid);
+            now[i].ws = ws;
+            if (!delta) continue;
+            if (ws >= 0 && ws < MAX_WORKSPACES)
+                used[ws] += (double)delta / (double)hz;
+
+            /* keep the five busiest, wherever they went */
+            int slot = cpu_top_n < 5 ? cpu_top_n : -1;
+            if (slot < 0) {
+                unsigned long long worst = delta;
+                for (int j = 0; j < 5; ++j)
+                    if (cpu_top[j].delta < worst) { worst = cpu_top[j].delta; slot = j; }
+            } else {
+                cpu_top_n++;
+            }
+            if (slot >= 0) {
+                cpu_top[slot].pid = now[i].pid;
+                cpu_top[slot].ws = ws;
+                cpu_top[slot].delta = delta;
+            }
+        }
+        /* A process that died since the last sample had its whole lifetime
+         * added to its parent's reaped-children total, and we already counted
+         * the part of it that ran before the last sample. Take that back, or
+         * every exit is counted twice. */
+        for (int j = 0; j < cpu_prev_n; ++j) {
+            bool alive = false;
+            for (int i = 0; i < n; ++i)
+                if (now[i].pid == cpu_prev[j].pid) { alive = true; break; }
+            if (alive) continue;
+            int ws = cpu_prev[j].ws;
+            if (ws >= 0 && ws < MAX_WORKSPACES)
+                used[ws] -= (double)(cpu_prev[j].own + cpu_prev[j].chld) / (double)hz;
+        }
+
+        cpu_ws_n = 0;
+        for (int i = 0; i < ws_count && i < MAX_WORKSPACES; ++i) {
+            if (used[i] < 0) used[i] = 0;
+            double pct = used[i] / dt / (double)ncpu * 100.0;
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            cpu_ws_pct[i] = pct;
+            str_set(cpu_ws_name[cpu_ws_n], sizeof(cpu_ws_name[0]), ws_list[i].name);
+            cpu_ws_n++;
+        }
+        cpu_write_cache();
+    }
+
+    free(cpu_prev);
+    cpu_prev = now;
+    cpu_prev_n = n;
+    cpu_last_at = at;
+}
+
 /* ---------------------------------------------------------------- config */
 
 /* A cell is one command whose output is drawn on the right hand side.
- * Declared with `cell=NAME`, configured with `NAME.field=value`. */
+ * Declared with `cell=NAME`, configured with `NAME.field=value`.
+ *
+ * `NAME.source=cmus` is the exception: swbr runs cmus-remote itself and reads
+ * the answer, so whether something is playing is a fact rather than a guess
+ * at what a script happened to print. */
+enum { SRC_CMD, SRC_CMUS };
+enum { PS_UNKNOWN = -1, PS_STOPPED = 0, PS_PAUSED = 1, PS_PLAYING = 2 };
 typedef struct {
     char  name[32];
     char  cmd[2048];
     int   interval;              /* seconds; 0 = run once; -1 = keep streaming */
     char  fmt[128];              /* %s is replaced by the output */
     char  empty[128];            /* drawn when the command prints nothing */
+    char  slim_on[64];           /* output containing this = the "on" state */
+    int   source;                /* SRC_CMD, or a player swbr knows itself   */
+    char  src_fmt[128];          /* how a known player is laid out           */
+    int   state;                 /* what that player is doing: PS_*          */
     int   gap;                   /* -1 = cell_gap */
     int   pad;                   /* inner padding, left and right */
     int   slim;                  /* how it shows in the folded strip */
     float slim_min, slim_max;    /* value range a gauge maps, default 0..100 */
     int   slim_w;                /* custom width in the folded strip */
+    Col   slim_color, slim_color2;   /* strip colour, and the minute colour */
+    bool  has_slim_color, has_slim_color2;
     Col   color, bg;
     bool  has_color, has_bg;
     Col   warn_col, crit_col;
@@ -845,7 +1097,11 @@ typedef struct {
     char bind[MAX_BINDS][512];
 
     /* colors */
-    Col bg, text, dim, accent, hl, urgent, outline;
+    Col bg, text, dim, accent, hl, urgent, outline, running, slim_warm;
+    int ws_cpu;                  /* the load dot on a workspace button   */
+    int ws_cpu_interval;         /* seconds between samples              */
+    float ws_cpu_min, ws_cpu_full;  /* below min nothing shows; full = the
+                                       load that paints it urgent        */
     Col ws_bg, ws_fg, ws_focused_bg, ws_focused_fg;
     Col ws_visible_bg, ws_visible_fg, ws_urgent_bg, ws_urgent_fg;
     Col mode_bg, mode_fg;
@@ -911,9 +1167,15 @@ static void config_defaults(Config *c)
     c->accent        = (Col){ 0x89, 0xaf, 0xc4, 0xff };
     c->hl            = (Col){ 0xcb, 0x9b, 0x00, 0xff };
     c->urgent        = (Col){ 0xe0, 0x53, 0x3c, 0xff };
+    c->running       = (Col){ 0x3d, 0xdc, 0x84, 0xff };
+    c->slim_warm     = (Col){ 0xe8, 0x96, 0x3c, 0xff };
     c->outline       = (Col){ 0x0a, 0x0e, 0x14, 0x99 };
     c->ws_bg         = (Col){ 0x1e, 0x27, 0x33, 0x00 };
     c->ws_fg         = (Col){ 0xb3, 0xc0, 0xcd, 0xff };
+    c->ws_cpu          = 1;
+    c->ws_cpu_interval = 3;
+    c->ws_cpu_min      = 4.0f;
+    c->ws_cpu_full     = 60.0f;
     c->ws_focused_bg = (Col){ 0xcb, 0x9b, 0x00, 0xff };
     c->ws_focused_fg = (Col){ 0x14, 0x14, 0x14, 0xff };
     c->ws_visible_bg = (Col){ 0x3c, 0x4a, 0x5c, 0xff };
@@ -971,19 +1233,55 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
 {
     Cell *e = cell_add(c, name);
     if (!e) return;
-    if (!strcmp(k, "cmd") || !strcmp(k, "command")) str_set(e->cmd, sizeof(e->cmd), v);
+    if (!strcmp(k, "cmd") || !strcmp(k, "command")) {
+        str_set(e->cmd, sizeof(e->cmd), v);
+        e->source = SRC_CMD;          /* your command prints, swbr shows it */
+    }
     else if (!strcmp(k, "interval")) e->interval = atoi(v);
     else if (!strcmp(k, "fmt") || !strcmp(k, "format")) str_set(e->fmt, sizeof(e->fmt), v);
     else if (!strcmp(k, "empty")) str_set(e->empty, sizeof(e->empty), v);
+    else if (!strcmp(k, "slim_on")) str_set(e->slim_on, sizeof(e->slim_on), v);
+    else if (!strcmp(k, "src_fmt") || !strcmp(k, "cmus_fmt"))
+        str_set(e->src_fmt, sizeof(e->src_fmt), v);
+    else if (!strcmp(k, "source")) {
+        if (!strcasecmp(v, "cmus")) {
+            e->source = SRC_CMUS;
+            /* everything a cmus cell needs, so the config line is enough.
+             * The command is not optional: swbr parses cmus-remote's own
+             * output, so a leftover cmd from a script would leave the cell
+             * with nothing it can read. */
+            str_set(e->cmd, sizeof(e->cmd), "cmus-remote -Q 2>/dev/null");
+            if (!e->interval) e->interval = 2;
+            if (e->slim == SLIM_AUTO) e->slim = SLIM_MEDIA;
+            if (!*e->bind[1])  str_set(e->bind[1], sizeof(e->bind[1]), "cmus-remote -u");
+            if (!*e->bind[2])  str_set(e->bind[2], sizeof(e->bind[2]), "cmus-remote -n");
+            if (!*e->bind[3])  str_set(e->bind[3], sizeof(e->bind[3]), "cmus-remote -r");
+        } else {
+            e->source = SRC_CMD;
+        }
+    }
     else if (!strcmp(k, "gap")) e->gap = atoi(v);
     else if (!strcmp(k, "pad")) e->pad = atoi(v);
     else if (!strcmp(k, "slim_min")) e->slim_min = (float)atof(v);
     else if (!strcmp(k, "slim_max")) e->slim_max = (float)atof(v);
     else if (!strcmp(k, "slim_w")) e->slim_w = atoi(v);
+    else if (!strcmp(k, "slim_color")) {
+        e->slim_color.a = 255;
+        parse_color(v, &e->slim_color);
+        e->has_slim_color = true;
+    }
+    else if (!strcmp(k, "slim_color2")) {
+        e->slim_color2.a = 255;
+        parse_color(v, &e->slim_color2);
+        e->has_slim_color2 = true;
+    }
     else if (!strcmp(k, "slim")) {
         if (!strcasecmp(v, "bar")) e->slim = SLIM_BAR;
         else if (!strcasecmp(v, "clock")) e->slim = SLIM_CLOCK;
         else if (!strcasecmp(v, "tick")) e->slim = SLIM_TICK;
+        else if (!strcasecmp(v, "presence") || !strcasecmp(v, "running") ||
+                 !strcasecmp(v, "app")) e->slim = SLIM_PRESENCE;
+        else if (!strcasecmp(v, "media") || !strcasecmp(v, "play")) e->slim = SLIM_MEDIA;
         else if (!strcasecmp(v, "off") || !strcmp(v, "0")) e->slim = SLIM_OFF;
         else e->slim = SLIM_AUTO;
     }
@@ -1086,9 +1384,15 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "accent")) parse_color(v, &c->accent);
     else if (!strcmp(k, "hl")) parse_color(v, &c->hl);
     else if (!strcmp(k, "urgent")) parse_color(v, &c->urgent);
+    else if (!strcmp(k, "running")) parse_color(v, &c->running);
+    else if (!strcmp(k, "slim_warm")) parse_color(v, &c->slim_warm);
     else if (!strcmp(k, "outline")) parse_color(v, &c->outline);
     else if (!strcmp(k, "ws_bg")) parse_color(v, &c->ws_bg);
     else if (!strcmp(k, "ws_fg")) parse_color(v, &c->ws_fg);
+    else if (!strcmp(k, "ws_cpu")) c->ws_cpu = atoi(v);
+    else if (!strcmp(k, "ws_cpu_interval")) c->ws_cpu_interval = atoi(v);
+    else if (!strcmp(k, "ws_cpu_min")) c->ws_cpu_min = (float)atof(v);
+    else if (!strcmp(k, "ws_cpu_full")) c->ws_cpu_full = (float)atof(v);
     else if (!strcmp(k, "ws_focused_bg")) parse_color(v, &c->ws_focused_bg);
     else if (!strcmp(k, "ws_focused_fg")) parse_color(v, &c->ws_focused_fg);
     else if (!strcmp(k, "ws_visible_bg")) parse_color(v, &c->ws_visible_bg);
@@ -1112,6 +1416,12 @@ static void strip_comment(char *v)
         if (*p == '\'' || *p == '"') { q = *p; continue; }
         if (*p == '#' && p > v && isspace((unsigned char)p[-1])) { *p = 0; return; }
     }
+}
+
+/* the shared ~/.config/sw/config, translated into swbr's own keys */
+static void config_set_shared(void *ud, const char *k, const char *v)
+{
+    config_set((Config *)ud, k, v);
 }
 
 static void config_load(Config *c, const char *path)
@@ -1884,8 +2194,22 @@ static Col msg_color(void)
     return msg_level >= 2 ? cfg.msg_error : (msg_level == 1 ? cfg.msg_warn : cfg.msg_info);
 }
 
+static int ctrl_req = 0;          /* 1 toggle, 2 fold, 3 unfold */
+
+static bool msg_control(const char *t)
+{
+    if (*t != ':') return false;
+    t++;
+    if (!strcasecmp(t, "toggle")) ctrl_req = 1;
+    else if (!strcasecmp(t, "fold") || !strcasecmp(t, "slim")) ctrl_req = 2;
+    else if (!strcasecmp(t, "unfold") || !strcasecmp(t, "full")) ctrl_req = 3;
+    else fprintf(stderr, "swbr: unknown control ':%s'\n", t);
+    return true;
+}
+
 static void msg_set(const char *line)
 {
+    if (msg_control(line)) return;
     const char *t = line;
     int lvl = 0;
     if (!strncasecmp(t, "error:", 6))        { lvl = 2; t += 6; }
@@ -1903,6 +2227,61 @@ static void msg_set(const char *line)
     str_set(msg_text, sizeof(msg_text), t);
     msg_level = lvl;
     msg_until = cfg.msg_timeout > 0 ? now_ms() + (uint32_t)cfg.msg_timeout * 1000u : 0;
+}
+
+/* Take over from a bar that is already running.
+ *
+ * `pkill swbr` in the sway config does not work reliably: sway forks each
+ * exec_always without waiting for it, so the kill and the new bar race, and
+ * the kill often wins — it terminates the instance that was just started. A
+ * bar that clears the way for itself has nothing to race against.
+ */
+static void replace_running(void)
+{
+    DIR *d = opendir("/proc");
+    if (!d) return;
+
+    pid_t me = getpid(), victims[32];
+    int   n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < (int)(sizeof victims / sizeof *victims)) {
+        bool digits = e->d_name[0] != 0;
+        for (const char *q = e->d_name; *q; ++q)
+            if (*q < '0' || *q > '9') { digits = false; break; }
+        if (!digits) continue;
+
+        pid_t pid = (pid_t)atoi(e->d_name);
+        if (pid == me || pid <= 1) continue;
+
+        char path[64], comm[64] = "";
+        snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;                       /* gone, or not ours to read */
+        if (fgets(comm, sizeof(comm), f)) {
+            char *nl = strchr(comm, '\n');
+            if (nl) *nl = 0;
+        }
+        fclose(f);
+        if (strcmp(comm, APP_ID)) continue;
+
+        struct stat st;
+        snprintf(path, sizeof(path), "/proc/%d", (int)pid);
+        if (stat(path, &st) != 0 || st.st_uid != getuid()) continue;
+
+        victims[n++] = pid;
+    }
+    closedir(d);
+
+    for (int i = 0; i < n; ++i) kill(victims[i], SIGTERM);
+
+    for (int wait = 0; wait < 40 && n; ++wait) {   /* up to two seconds */
+        usleep(50000);
+        int left = 0;
+        for (int i = 0; i < n; ++i)
+            if (kill(victims[i], 0) == 0) victims[left++] = victims[i];
+        n = left;
+    }
+    for (int i = 0; i < n; ++i) kill(victims[i], SIGKILL);   /* stubborn */
 }
 
 static void msg_open(void)
@@ -1990,9 +2369,91 @@ static void cell_spawn(Cell *e)
     e->len = 0;
 }
 
+/* `cmus-remote -Q` prints one key per line:
+ *     status playing
+ *     file /music/x.flac
+ *     tag artist Boards of Canada
+ *     tag title Roygbiv
+ * Nothing at all means cmus is not running. */
+static void cmus_parse(Cell *e)
+{
+    char status[32] = "", artist[256] = "", title[256] = "", file[512] = "";
+
+    for (char *line = e->buf; line && *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *v;
+        if (!strncmp(line, "status ", 7))
+            str_set(status, sizeof(status), trim(line + 7));
+        else if (!strncmp(line, "file ", 5))
+            str_set(file, sizeof(file), trim(line + 5));
+        else if (!strncmp(line, "tag artist ", 11))
+            str_set(artist, sizeof(artist), trim(line + 11));
+        else if (!strncmp(line, "tag title ", 10))
+            str_set(title, sizeof(title), trim(line + 10));
+        else if (!strncmp(line, "tag albumartist ", 16) && !*artist)
+            str_set(artist, sizeof(artist), trim(line + 16));
+        (void)v;
+        line = nl ? nl + 1 : NULL;
+    }
+
+    e->state = !*status                      ? PS_UNKNOWN
+             : !strcmp(status, "playing")    ? PS_PLAYING
+             : !strcmp(status, "paused")     ? PS_PAUSED
+                                             : PS_STOPPED;
+
+    if (e->state == PS_UNKNOWN || e->state == PS_STOPPED) { e->out[0] = 0; return; }
+
+    if (!*title && *file) {                              /* fall back to the name */
+        const char *base = strrchr(file, '/');
+        str_set(title, sizeof(title), base ? base + 1 : file);
+        char *dot = strrchr(title, '.');
+        if (dot && dot != title) *dot = 0;
+    }
+
+    /* ▶ while playing, ⏸ while paused — the icon is the state, so it is right
+     * whether or not the player prints one */
+    const char *icon = e->state == PS_PLAYING ? "\xe2\x96\xb6" : "\xe2\x8f\xb8";
+
+    char name[600];
+    if (*artist && *title) snprintf(name, sizeof(name), "%s — %s", artist, title);
+    else                   snprintf(name, sizeof(name), "%s", title);
+
+    /* %i icon  %n artist — title  %a artist  %t title  %s playing|paused
+     * so one cell can be just the icon and another just the name */
+    const char *f = *e->src_fmt ? e->src_fmt : "%i %n";
+    size_t o = 0;
+    for (const char *p = f; *p && o < sizeof(e->out) - 1; ++p) {
+        const char *ins = NULL;
+        if (*p == '%' && p[1]) {
+            switch (p[1]) {
+            case 'i': ins = icon;   break;
+            case 'n': ins = name;   break;
+            case 'a': ins = artist; break;
+            case 't': ins = title;  break;
+            case 's': ins = e->state == PS_PLAYING ? "playing" : "paused"; break;
+            case '%': ins = "%";    break;
+            default:  break;
+            }
+        }
+        if (!ins) { e->out[o++] = *p; continue; }
+        ++p;
+        size_t l = strlen(ins);
+        if (o + l >= sizeof(e->out)) l = sizeof(e->out) - 1 - o;
+        memcpy(e->out + o, ins, l);
+        o += l;
+    }
+    e->out[o] = 0;
+    char *t = trim(e->out);
+    if (t != e->out) memmove(e->out, t, strlen(t) + 1);
+}
+
 static void cell_finish(Cell *e)
 {
     e->buf[e->len] = 0;
+
+    if (e->source == SRC_CMUS) { cmus_parse(e); e->len = 0; return; }
+
     char *t = trim(e->buf);
     for (char *q = t; *q; ++q) if (*q == '\n' || *q == '\r' || *q == '\t') *q = ' ';
     str_set(e->out, sizeof(e->out), t);
@@ -2070,7 +2531,14 @@ static void cell_text(Cell *e, char *out, size_t cap)
     if (!*e->fmt) { str_set(out, cap, e->out); return; }
     const char *pc = strstr(e->fmt, "%s");
     if (!pc) { str_set(out, cap, e->fmt); return; }
-    snprintf(out, cap, "%.*s%s%s", (int)(pc - e->fmt), e->fmt, e->out, pc + 2);
+    size_t head = (size_t)(pc - e->fmt);
+    if (head >= cap) head = cap - 1;
+    memcpy(out, e->fmt, head);
+    out[head] = 0;
+    size_t n = strlen(out);
+    if (n < cap - 1) str_set(out + n, cap - n, e->out);
+    n = strlen(out);
+    if (n < cap - 1) str_set(out + n, cap - n, pc + 2);
 }
 
 /* the first number in the output, ignoring markup tags */
@@ -2301,6 +2769,17 @@ static float baseline_for(Font *f, float y0, float vis, float s)
     return y0 + vis * 0.5f + (f->ascent - f->lineh * 0.5f) + cfg.text_y * s;
 }
 
+static Col col_mix(Col a, Col b, float t)
+{
+    t = clampf(t, 0.0f, 1.0f);
+    Col o;
+    o.r = (uint8_t)((float)a.r + ((float)b.r - (float)a.r) * t);
+    o.g = (uint8_t)((float)a.g + ((float)b.g - (float)a.g) * t);
+    o.b = (uint8_t)((float)a.b + ((float)b.b - (float)a.b) * t);
+    o.a = (uint8_t)((float)a.a + ((float)b.a - (float)a.a) * t);
+    return o;
+}
+
 static Col col_scale_alpha(Col c, float f)
 {
     c.a = (uint8_t)clampi((int)lroundf((float)c.a * clampf(f, 0.0f, 1.0f)), 0, 255);
@@ -2341,29 +2820,117 @@ static float slim_width_of(Cell *e, int mode, float s)
     switch (mode) {
     case SLIM_CLOCK: return 12.0f * 3.0f * s + 11.0f * 2.0f * s;
     case SLIM_BAR:   return 40.0f * s;
+    case SLIM_PRESENCE: return 10.0f * s;
+    case SLIM_MEDIA: return 26.0f * s;
     case SLIM_OFF:   return 0.0f;
     default:         return 12.0f * s;
     }
 }
 
 
+/* The colour a cell shows on the strip: its own slim_color, else the colour
+ * it painted its own text with, so folding never changes what a thing looks
+ * like. A cyan clock stays cyan. */
+static Col slim_color_of(Cell *e)
+{
+    if (e->has_slim_color) return e->slim_color;
+    char txt[1024];
+    Col base;
+    cell_display(e, txt, sizeof(txt), &base);
+    if (e->markup) {
+        Runs rs;
+        int saved = cfg.markup;
+        cfg.markup = 1;
+        markup_parse(txt, &rs, base);
+        cfg.markup = saved;
+        for (int i = 0; i < rs.n; ++i)
+            if (rs.v[i].has_fg) return rs.v[i].fg;
+    }
+    return base;
+}
+
+/* +, an up arrow or a bolt mean charging; -, a down arrow mean draining;
+ * =, a tick mean full. Anything else: no direction shown. */
+static int slim_direction(const char *s)
+{
+    if (strchr(s, '+') || strstr(s, "\xe2\x86\x91") || strstr(s, "\xe2\x9a\xa1")) return 1;
+    if (strchr(s, '=') || strstr(s, "\xe2\x9c\x93")) return 0;
+    if (strchr(s, '-') || strstr(s, "\xe2\x86\x93")) return -1;
+    return 2;
+}
+
+/* 1 = playing, 0 = not, -1 = the cell has said nothing at all yet.
+ *
+ * `slim_on` is the reliable way: give it a word your command prints only while
+ * something is playing. Without it we guess from the usual glyphs, which only
+ * works if your player happens to print one of them. `swbr --probe` prints
+ * what this decided for every cell, next to the text it decided it from. */
+static int media_state(const Cell *e)
+{
+    /* A player swbr talks to itself has already said which it is. Paused is
+     * not playing, and that is the distinction the strip is there to show. */
+    if (e->source != SRC_CMD) {
+        if (e->state == PS_UNKNOWN) return -1;
+        return e->state == PS_PLAYING ? 1 : 0;
+    }
+    if (!e->out[0]) return -1;
+    if (*e->slim_on) return strstr(e->out, e->slim_on) != NULL;
+
+    /* Paused first: a bar showing "⏸ Artist — Title" is not playing, and
+     * looking for the play glyph first would call it playing anyway. */
+    static const char *PAUSED[] = {
+        "\xe2\x8f\xb8",      /* ⏸ */
+        "\xe2\x9d\x9a",      /* ❚ */
+        "paused",
+    };
+    for (size_t i = 0; i < sizeof PAUSED / sizeof *PAUSED; ++i)
+        if (strcasestr(e->out, PAUSED[i])) return 0;
+
+    static const char *PLAYING[] = {
+        "\xe2\x96\xb6",      /* ▶ */
+        "\xf0\x9f\x8e\xb5", /* 🎵 */
+        "\xe2\x99\xaa",      /* ♪ */
+        "playing",
+    };
+    for (size_t i = 0; i < sizeof PLAYING / sizeof *PLAYING; ++i)
+        if (strcasestr(e->out, PLAYING[i])) return 1;
+    return 0;
+}
+
 static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
                           float w, float h, float s)
 {
-    Col c = cell_color(e);
+    Col c = slim_color_of(e);
+    if (mode == SLIM_PRESENCE) {
+        /* the cell only exists while its program does, so a block here means
+         * "that one is up" — its own colour, not shared with any gauge */
+        if (!e->has_slim_color) c = cfg.running;
+        fill_rect(cv, x, y, w, h, c);
+        return;
+    }
     if (mode == SLIM_CLOCK) {
         time_t t = time(NULL);
         struct tm tmv;
         localtime_r(&t, &tmv);
-        int hour = tmv.tm_hour % 12;
+        int hour = (tmv.tm_hour + 11) % 12 + 1;    /* 1..12, 0:xx reads as 12 */
         float dot = 3.0f * s, gap = 2.0f * s;
+        /* every dot up to the hour, so you count bars instead of finding the
+         * one lit position: 2 bars at 02:00, still 2 at 02:55. Morning uses
+         * the second colour, afternoon the main one, so 1:00 and 13:00 differ. */
+        Col hc = tmv.tm_hour >= 12 ? c
+               : (e->has_slim_color2 ? e->slim_color2 : cfg.accent);
         for (int i = 0; i < 12; ++i) {
             Col dc = cfg.dim;
-            float dw = dot;
-            if (i < hour) dc = cfg.accent;
-            else if (i == hour) { dc = cfg.hl; dw = dot * (0.35f + 0.65f * (float)tmv.tm_min / 59.0f); }
-            fill_rect(cv, x + (float)i * (dot + gap), y, dw, h, dc);
+            dc.a = 90;
+            if (i < hour) dc = hc;
+            fill_rect(cv, x + (float)i * (dot + gap), y, dot, h, dc);
         }
+        /* the minutes run along the bottom half, in the second colour */
+        Col mc = e->has_slim_color2 ? e->slim_color2 : cfg.accent;
+        mc.a = 200;
+        float span = 12.0f * dot + 11.0f * gap;
+        float half = h * 0.5f;
+        fill_rect(cv, x, y + h - half, span * (float)tmv.tm_min / 60.0f, half, mc);
         return;
     }
     if (mode == SLIM_BAR) {
@@ -2372,14 +2939,92 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
         float lo = e->slim_min, hi = e->slim_max;
         float f = (hi > lo) ? (v - lo) / (hi - lo) : 0.0f;
         f = clampf(f, 0.0f, 1.0f);
+        int dir = slim_direction(e->out);
+        Col fillc = c;                             /* the fill keeps whatever
+                                                    * warn/crit decided */
         Col track = cfg.dim;                       /* visible, or a part filled
                                                     * gauge just looks short */
         track.a = 110;
         fill_rect(cv, x, y, w, h, track);
-        if (have) fill_rect(cv, x, y, w * f, h, c);
+        if (have) fill_rect(cv, x, y, w * f, h, fillc);
+        if (dir == 2) return;
+
+        /* The pips run a colour ramp away from the fill: warm into red while
+         * it drains, warm into green while it fills. Direction and roughly
+         * how hard it is working, in three dots. */
+        Col far = dir > 0 ? cfg.running : (dir == 0 ? cfg.running : cfg.urgent);
+        float edge = x + w * f, pip = 2.0f * s, step = 3.0f * s;
+        for (int i = 0; i < 3; ++i) {
+            /* Start most of the way to the far colour, not at the warm end:
+             * ramping from 0 left the brightest pip orange and the green one
+             * dim, so charging and draining looked much the same. */
+            Col pc = col_mix(cfg.slim_warm, far, 0.45f + (float)i * 0.275f);
+            pc.a = (uint8_t)(245 - i * 35);
+            float px_ = dir > 0 ? edge + (float)i * step
+                      : dir < 0 ? edge - (float)(i + 1) * step
+                      : x + w - (float)(3 - i) * step;
+            if (px_ < x || px_ + pip > x + w) continue;
+            fill_rect(cv, px_, y, pip, h, pc);
+        }
         return;
     }
+    if (mode == SLIM_MEDIA) {
+        /* Playing: two full-height bars, the pause glyph at five pixels, in
+         * the cell's own colour. Not playing: one short stub at a third of
+         * the height, well under half as bright. Same shape at two sizes read
+         * as the same thing, so the two states differ in height as well. */
+        int st = media_state(e);
+        if (st > 0) {                             /* playing: two full bars */
+            float bar = w * 0.38f, gapw = w - 2.0f * bar;
+            fill_rect(cv, x, y, bar, h, c);
+            fill_rect(cv, x + bar + gapw, y, bar, h, c);
+        } else if (st == 0) {                     /* paused: the same two,
+                                                     short and dim */
+            Col d = c;
+            d.a = 110;
+            float bar = w * 0.38f, gapw = w - 2.0f * bar;
+            fill_rect(cv, x, y + h * 0.34f, bar, h * 0.32f, d);
+            fill_rect(cv, x + bar + gapw, y + h * 0.34f, bar, h * 0.32f, d);
+        }
+        return;                                   /* st < 0: nothing to show */
+    }
     fill_rect(cv, x, y, w, h, c);
+}
+
+/* A disc filled from the bottom: empty at rest, full when it is working hard.
+ * `frac` 0..1 is how much of it is lit. */
+static void fill_moon(Canvas *cv, float cx, float cy, float r, float frac, Col c)
+{
+    if (r < 0.5f) return;
+    float top = cy + r - 2.0f * r * clampf(frac, 0.0f, 1.0f);
+    for (float dy = -r; dy <= r; dy += 1.0f) {
+        float y = cy + dy;
+        if (y < top) continue;
+        float half = sqrtf(r * r - dy * dy);
+        fill_rect(cv, cx - half, y, half * 2.0f, 1.0f, c);
+    }
+}
+
+/* How busy, as a colour: quiet green through the accent into urgent. Nothing
+ * at all below ws_cpu_min, so an idle bar stays clean. */
+static bool cpu_load_col(int ws_idx, Col *out, float *frac)
+{
+    if (!cfg.ws_cpu || ws_idx < 0 || ws_idx >= cpu_ws_n) return false;
+    double pct = cpu_ws_pct[ws_idx];
+    if (pct < cfg.ws_cpu_min) return false;
+
+    float f = cfg.ws_cpu_full > cfg.ws_cpu_min
+            ? (float)(pct - cfg.ws_cpu_min) / (cfg.ws_cpu_full - cfg.ws_cpu_min)
+            : 1.0f;
+    f = clampf(f, 0.0f, 1.0f);
+    *frac = f;
+    Col hot = f < 0.5f ? col_mix(cfg.accent, cfg.slim_warm, f * 2.0f)
+                       : col_mix(cfg.slim_warm, cfg.urgent, (f - 0.5f) * 2.0f);
+    /* held back towards the bar's own dim, and never fully opaque: it should
+     * be readable out of the corner of an eye, not competing with the name */
+    *out = col_mix(cfg.dim, hot, 0.6f + 0.4f * f);
+    out->a = (uint8_t)(190 + 65 * f);
+    return true;
 }
 
 static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs)
@@ -2394,12 +3039,13 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
     }
 
     /* one fixed slot per workspace number, so slot 3 is always workspace 3 */
-    int slots = 0;
-    for (int i = 0; i < ws_count; ++i)
-        if (ws_on_bar(b, &ws_list[i]) && ws_list[i].num > slots) slots = ws_list[i].num;
-    if (slots <= 0)
-        for (int i = 0; i < ws_count; ++i) if (ws_on_bar(b, &ws_list[i])) slots++;
-    if (cfg.slim_ws_slots > 0 && slots > cfg.slim_ws_slots) slots = cfg.slim_ws_slots;
+    /* always the full set, so an empty workspace still holds its place and
+     * the lit ones never move */
+    int slots = cfg.slim_ws_slots;
+    if (slots <= 0) {
+        for (int i = 0; i < ws_count; ++i)
+            if (ws_on_bar(b, &ws_list[i]) && ws_list[i].num > slots) slots = ws_list[i].num;
+    }
 
     float tick = 14.0f * s;
     b->hits = 0;
@@ -2415,6 +3061,17 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
             else { c = cfg.dim; c.a = 170; }
         }
         fill_rect(cv, x, y, tick, h, c);
+        if (w) {
+            int wi = (int)(w - ws_list);
+            Col lc; float lf;
+            if (cpu_load_col(wi, &lc, &lf)) {
+                /* the slot is only a few pixels tall, so the load is drawn as
+                 * a lit portion of it rising from the bottom rather than as a
+                 * dot nobody would see */
+                float lh = clampf(h * (0.35f + 0.65f * lf), 1.0f, h);
+                fill_rect(cv, x, y + h - lh, tick, lh, lc);
+            }
+        }
         if (w && b->hits < MAX_WORKSPACES) {      /* still switchable when folded */
             b->hit[b->hits].x0 = x / s;
             b->hit[b->hits].x1 = (x + tick) / s;
@@ -2533,6 +3190,22 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
 
         pill(cv, x, y0, vis, bwid, s, rad, col_scale_alpha(bg, fade));
         text_draw(cv, f, x + (bwid - tw) * 0.5f, base, col_scale_alpha(fg, fade), w->label);
+
+        Col lc; float lf;
+        if (cpu_load_col(i, &lc, &lf)) {
+            /* Top right of the button, big enough to actually see: a dim
+             * whole disc for the outline, then the lit part rising through
+             * it. The pill underneath can be bright orange, so the rim keeps
+             * a dark ring around it. */
+            float r  = clampf(vis * 0.17f, 3.0f * s, 6.0f * s);
+            float mx = x + bwid - r - 3.0f * s, my = y0 + r + 3.0f * s;
+
+            Col ring = cfg.bg; ring.a = 200;
+            fill_moon(cv, mx, my, r + 1.0f * s, 1.0f, col_scale_alpha(ring, fade));
+            Col rim = lc; rim.a = 90;
+            fill_moon(cv, mx, my, r, 1.0f, col_scale_alpha(rim, fade));
+            fill_moon(cv, mx, my, r, 0.2f + 0.8f * lf, col_scale_alpha(lc, fade));
+        }
 
         if (b->hits < MAX_WORKSPACES) {
             b->hit[b->hits].x0 = x / s;
@@ -3406,8 +4079,14 @@ static void usage(void)
 "\n"
 "  --config PATH       read this file instead of the default\n"
 "  --dump-config       print a config file with all defaults, then exit\n"
+"  --replace           terminate any swbr already running, then start. Use\n"
+"                      this rather than `pkill swbr` in the sway config: sway\n"
+"                      forks each exec_always without waiting, so a kill on\n"
+"                      one line races the bar started on the next\n"
 "  --probe             print outputs, sizes, font metrics and cell values\n"
 "  --slim              start folded (same as start_collapsed=1)\n"
+"  --toggle            fold or unfold the running bar. Also --fold/--unfold\n"
+"                      bindsym $mod+b exec swbr --toggle\n"
 "  --msg TEXT          send a message to the running bar, then exit\n"
 "                      'warn: ..', 'error: ..', 'info: ..', or 'clear'\n"
 "  --help, --version\n"
@@ -3474,10 +4153,27 @@ static void usage(void)
 "  NAME.sep=1          draw the separator after this cell\n"
 "  NAME.hide_empty=1   no output = the cell and its separator disappear\n"
 "  NAME.empty=TEXT     drawn instead of hiding, so the area stays clickable\n"
+"  NAME.slim_on=TEXT   output containing this counts as the 'on' state for\n"
+"                      slim=media, e.g. the icon your player prints\n"
 "  NAME.gap=           space after this cell; 0 glues it to the next one and\n"
 "                      equal background colours merge into a single box\n"
 "  NAME.pad=0          padding inside the cell, left and right\n"
-"  NAME.slim=auto      folded strip: auto | tick | bar | clock | off\n"
+"  NAME.slim=auto      folded strip: auto | tick | bar | clock | presence\n"
+"                      | media | off. presence = a block in the running\n"
+"                      colour, there only while the program is. media = two\n"
+"                      bars while playing, one dim one when not\n"
+"  NAME.slim_color=    override this cell's colour on the strip. Without it\n"
+"                      the strip reuses the colour the cell's own text has\n"
+"  NAME.source=cmus    swbr runs cmus-remote itself: playing and paused are\n"
+"                      read from it rather than guessed from the text, and\n"
+"                      the command, interval, slim=media and the mouse binds\n"
+"                      are filled in for you\n"
+"  NAME.cmus_fmt=%i %n how it is laid out: %i icon, %n artist — title, %a,\n"
+"                      %t, %s playing|paused. One cell can be just the icon\n"
+"                      and another just the name\n"
+"  NAME.slim_color2=   second colour: the minutes of a clock cell, and its\n"
+"                      hour bars before noon. clock lights every bar up to\n"
+"                      the hour, so 02:00 and 02:55 both show two\n"
 "  NAME.slim_min=0 NAME.slim_max=100   the range a gauge maps\n"
 "  NAME.slim_w=0       width in the folded strip, 0 = the mode's default\n"
 "  NAME.markup=1       parse pango markup in this cell's output\n"
@@ -3506,7 +4202,7 @@ static void usage(void)
 "  signals=1           the folded strip keeps saying something: a fixed slot\n"
 "                      per workspace, twelve dots for a clock cell, a gauge\n"
 "                      for anything with a percentage\n"
-"  slim_ws_slots=10    at most this many workspace slots\n"
+"  slim_ws_slots=10    always show this many workspace slots\n"
 "  start_collapsed=0\n"
 "  SIGUSR1 folds or unfolds every bar:  pkill -USR1 swbr\n"
 "\n"
@@ -3517,7 +4213,10 @@ static void usage(void)
 "colors (#rrggbb or #rrggbbaa)\n"
 "  bg text dim accent hl urgent outline\n"
 "  ws_bg ws_fg ws_focused_bg ws_focused_fg ws_visible_bg ws_visible_fg\n"
-"  ws_urgent_bg ws_urgent_fg mode_bg mode_fg\n", stdout);
+"  ws_urgent_bg ws_urgent_fg mode_bg mode_fg\n"
+"  running             the folded strip's 'this program is up' colour\n"
+"  slim_warm           where a gauge's direction pips start before they ramp\n"
+"                      into running (charging) or urgent (draining)\n", stdout);
 }
 
 static void print_color(const char *k, Col c)
@@ -3576,6 +4275,8 @@ static void dump_config(void)
     print_color("accent", c.accent);
     print_color("hl", c.hl);
     print_color("urgent", c.urgent);
+    print_color("running", c.running);
+    print_color("slim_warm", c.slim_warm);
     print_color("outline", c.outline);
     print_color("ws_bg", c.ws_bg);
     print_color("ws_fg", c.ws_fg);
@@ -3592,6 +4293,7 @@ static void dump_config(void)
 /* ------------------------------------------------------------------ main */
 
 static int  probe = 0;
+static int  do_replace = 0;
 static int  cfg_start_collapsed_arg = 0;
 
 static void probe_report(void)
@@ -3631,10 +4333,64 @@ static void probe_report(void)
                f->px, (double)f->ascent, (double)f->lineh,
                (double)baseline_for(f, 0, (float)b->bh, (float)b->scale), b->bh);
     }
+    if (cfg.ws_cpu) {
+        printf("cpu per workspace, sampled every %ds (min %g%%, full %g%%)\n",
+               cfg.ws_cpu_interval, (double)cfg.ws_cpu_min, (double)cfg.ws_cpu_full);
+        printf("            %d window(s) in sway's tree to attribute work to\n",
+               cpu_nwin);
+        for (int i = 0; i < cpu_nwin && i < 8; ++i)
+            printf("            pid %-7d -> %s\n", cpu_win[i].pid,
+                   cpu_win[i].ws >= 0 && cpu_win[i].ws < ws_count
+                       ? ws_list[cpu_win[i].ws].name : "(no workspace)");
+
+        printf("            busiest processes in that sample:\n");
+        for (int i = 0; i < cpu_top_n; ++i) {
+            char path[64], comm[64] = "?";
+            snprintf(path, sizeof(path), "/proc/%d/comm", cpu_top[i].pid);
+            FILE *cf = fopen(path, "r");
+            if (cf) {
+                if (fgets(comm, sizeof(comm), cf)) {
+                    char *nl = strchr(comm, '\n');
+                    if (nl) *nl = 0;
+                }
+                fclose(cf);
+            }
+            printf("            %-16s pid %-7d -> %s\n", comm, cpu_top[i].pid,
+                   cpu_top[i].ws >= 0 && cpu_top[i].ws < ws_count
+                       ? ws_list[cpu_top[i].ws].name : "no workspace (not under a window)");
+        }
+        if (!cpu_ws_n) printf("            no sample yet\n");
+        for (int i = 0; i < cpu_ws_n; ++i)
+            printf("            %-12s %5.1f%%\n", cpu_ws_name[i], cpu_ws_pct[i]);
+    }
+    static const char *SLIM_NAME[] = { "auto", "tick", "bar", "clock",
+                                       "presence", "media", "off" };
     for (int i = 0; i < cfg.cell_count; ++i) {
         Cell *e = &cfg.cell[i];
         printf("cell %-10s iv=%-3d min_w=%-4d sep=%d  '%s'\n",
                e->name, e->interval, e->min_w, e->sep, e->out);
+
+        int mode = slim_mode(e);
+        printf("            slim=%s", SLIM_NAME[mode]);
+        if (e->slim == SLIM_AUTO && mode != SLIM_AUTO) printf(" (auto)");
+        if (mode == SLIM_MEDIA) {
+            int st = media_state(e);
+            printf("  playing=%s", st > 0 ? "yes" : st == 0 ? "no" : "(no output yet)");
+            if (e->source == SRC_CMUS)
+                printf("  from cmus-remote (%s)",
+                       e->state == PS_PLAYING ? "playing" :
+                       e->state == PS_PAUSED  ? "paused"  :
+                       e->state == PS_STOPPED ? "stopped" : "not running");
+            else if (*e->slim_on)
+                printf("  slim_on='%s'%s", e->slim_on,
+                       strstr(e->out, e->slim_on) ? " found" : " NOT in the output");
+            else printf("  slim_on unset, guessing from the text");
+        } else if (mode == SLIM_BAR) {
+            float v = 0;
+            printf("  value=%s  range %g..%g", cell_number(e->out, &v) ? "yes" : "no",
+                   (double)e->slim_min, (double)e->slim_max);
+        }
+        printf("\n");
     }
     printf("folded strip (%d px), right side left to right:\n", cfg.collapsed_px);
     for (int i = 0; i < layout_n[G_RIGHT]; ++i) {
@@ -3647,9 +4403,18 @@ static void probe_report(void)
         float v = 0;
         bool have = cell_number(e->out, &v);
         const char *mn = m == SLIM_BAR ? "gauge" : m == SLIM_CLOCK ? "clock"
-                       : m == SLIM_OFF ? "off" : "tick";
+                       : m == SLIM_OFF ? "off"
+                       : m == SLIM_PRESENCE ? "up"
+                       : m == SLIM_MEDIA ? "media" : "tick";
         printf("  %-10s %-5s %3.0fpx %02x%02x%02x", e->name, mn,
                (double)slim_width_of(e, m, 1.0f), c.r, c.g, c.b);
+        if (m == SLIM_MEDIA) {
+            bool on = *e->slim_on ? strstr(e->out, e->slim_on) != NULL
+                                  : (strstr(e->out, "\xe2\x9d\x9a") != NULL ||
+                                     strcasestr(e->out, "playing") != NULL);
+            printf("  %s (slim_on='%s')", on ? "PLAYING: two bars" : "not playing: one block",
+                   *e->slim_on ? e->slim_on : "(guessing from the icon)");
+        }
         if (m == SLIM_BAR && have)
             printf("  %.1f of %g..%g = %.0f%% full",
                    (double)v, (double)e->slim_min, (double)e->slim_max,
@@ -3692,24 +4457,32 @@ int main(int argc, char **argv)
             printf("SwBr %s (build %s)\n", SWBR_VERSION, SWBR_BUILD); return 0;
         } else if (!strcmp(argv[i], "--dump-config")) { dump_config(); return 0; }
         else if (!strcmp(argv[i], "--probe")) probe = 1;
+        else if (!strcmp(argv[i], "--replace")) do_replace = 1;
         else if (!strcmp(argv[i], "--slim") || !strcmp(argv[i], "--collapsed"))
             cfg_start_collapsed_arg = 1;
     }
 
-    config_defaults(&cfg);
-    config_load(&cfg, cfgpath);
+    if (do_replace) replace_running();   /* clear the way before asking for a surface */
 
-    for (int i = 1; i < argc; ++i)                  /* talk to a running bar */
+    config_defaults(&cfg);
+    sw_shared_apply("swbr", config_set_shared, &cfg);   /* shared first */
+    config_load(&cfg, cfgpath);                         /* our own wins  */
+
+    for (int i = 1; i < argc; ++i) {               /* talk to a running bar */
         if (!strcmp(argv[i], "--msg") || !strcmp(argv[i], "-m")) {
             if (i + 1 >= argc) die("--msg needs a text ('warn: ..', 'clear')");
             return msg_send(argv[i + 1]);
         }
+        if (!strcmp(argv[i], "--toggle")) return msg_send(":toggle");
+        if (!strcmp(argv[i], "--fold")) return msg_send(":fold");
+        if (!strcmp(argv[i], "--unfold")) return msg_send(":unfold");
+    }
 
     for (int i = 1; i < argc; ++i) {                 /* command line wins */
         const char *a = argv[i];
         if (!strcmp(a, "--config")) { i++; continue; }
         if (!strcmp(a, "--probe") || !strcmp(a, "--slim") ||
-            !strcmp(a, "--collapsed")) continue;
+            !strcmp(a, "--replace") || !strcmp(a, "--collapsed")) continue;
         if (!strcmp(a, "-s") && i + 1 < argc) a = argv[++i];
         else if (!strncmp(a, "--", 2)) a += 2;
         char buf[4096];
@@ -3753,10 +4526,12 @@ int main(int argc, char **argv)
     msg_open();
 
     if (probe) {
+        if (cfg.ws_cpu) cpu_sample();           /* the first of the two */
         for (int i = 0; i < 60; ++i) {          /* give the cells a moment */
             cells_read();
             usleep(20000);
         }
+        if (cfg.ws_cpu) cpu_sample();           /* and the one that measures */
         wl_display_roundtrip(dpy);
         probe_report();
         cells_stop();
@@ -3782,7 +4557,25 @@ int main(int argc, char **argv)
         cells_tick();
         if (cells_read()) redraw = true;
         if (msg_read()) redraw = true;
+        if (ctrl_req) {
+            for (int i = 0; i < output_count; ++i) {
+                Bar *b = outputs[i].bar;
+                if (!b) continue;
+                bar_set_collapsed(b, ctrl_req == 1 ? !b->collapsed : ctrl_req == 2);
+            }
+            ctrl_req = 0;
+            redraw = true;
+        }
         if (msg_expiry_due()) redraw = true;
+
+        if (cfg.ws_cpu && cfg.ws_cpu_interval > 0) {
+            static uint32_t cpu_next;
+            if (!cpu_next || (int32_t)(now_ms() - cpu_next) >= 0) {
+                cpu_sample();
+                cpu_next = now_ms() + (uint32_t)cfg.ws_cpu_interval * 1000u;
+                redraw = true;
+            }
+        }
 
         if (status_fd < 0 && *cfg.status_command && status_next_spawn &&
             (int32_t)(now_ms() - status_next_spawn) >= 0) {
@@ -3821,7 +4614,8 @@ int main(int argc, char **argv)
 
         int timeout = -1;
         if (animating || scroll_running) timeout = 16;
-        else if (cfg.cell_count || msg_until) timeout = 100;
+        else if (cfg.cell_count || msg_until || (cfg.ws_cpu && cfg.ws_cpu_interval > 0))
+            timeout = 100;
         else if (status_fd < 0 && *cfg.status_command) timeout = 100;
         else {
             bool any_dirty = false;

@@ -1,289 +1,220 @@
-# SwBr
+# swbr
 
-**100% Vibecode but tested.**
+A floating bar for [Sway](https://swaywm.org), on the layer shell. It sits on
+top of the tiled windows at the screen edge instead of taking space from them.
+Hover it and press space and it folds into a thin strip that still tells you
+what is going on.
 
-A floating status bar for Sway. Replaces `swaybar`. Binary: `swbr`.
+![swbr](screenshot.png)
 
-It sits on the layer shell above the tiled windows, flush with the top edge.
-Hover it, press space, and it rolls up into a 5px signal strip.
-
-![SwBr](screenshot.png)
-
-Folded: workspace slots, twelve clock dots, gauges — still readable, still
-clickable.
-
-![SwBr folded](screenshot-slim.png)
-
-Version: **0.8.1**
-
-## Why not swaybar
-
-- Floats above the windows instead of taking their space (`exclusive=0`).
-- Folds away on a key, without re-tiling anything.
-- Bar squared off against the screen edge, rounded on the free side. The
-  focused workspace is a full-height block in the appwheel orange.
-- Same look and same `key=value` config as `swov` and `appwheel`.
+100% vibecode, but tested.
 
 ## Build
 
 ```sh
+sudo apt install build-essential libwayland-dev
 make
+make install          # ~/.local/bin, or PREFIX=/usr/local
+make config           # optional: swbr_config.example -> ~/.config/swbr/config
 ```
 
-or by hand:
+`libwayland-client` is the only library it links. The wlr-layer-shell protocol
+glue is vendored, so there is no `wayland-scanner` step. Fonts come from
+`stb_truetype.h`, also vendored.
 
-```sh
-cc -std=c11 -O2 -Wall -Wextra -o swbr swbr.c -lwayland-client -lm
-```
-
-`stb_truetype.h` sits next to the source, same as for `appwheel`.
-The layer-shell protocol glue is vendored inside `swbr.c`, so there is no
-`wayland-scanner` step.
-
-Needs: `libwayland-client`, a running Sway session (`$SWAYSOCK`).
-Optional: `fc-match` to pick up the desktop font.
-
-## Install
-
-```sh
-make install          # -> ~/bin/swbr, override with PREFIX= or BINDIR=
-make config           # -> ~/.config/swbr/config, never overwrites
-```
-
-**Delete the `bar { ... }` block from your sway config.** If you leave it,
-swaybar keeps running underneath and you see its text peeking out below SwBr.
-Then add:
-
-```
-exec_always pkill -x swobar; exec_always ~/bin/swbr
-```
-
-Your old `status_command` script keeps working — point the config at it:
-
-```
-status_command=~/bin/sway_bar_status.sh
-```
-
-## Cells
-
-The right hand side is a row of cells. One command per cell, its own
-interval, its own colour. No status script in between.
-
-```
-cell=cpu                    # order of the cell= lines = order on the bar
-cpu.cmd=cpu_in_percent
-cpu.fmt=%s%
-cpu.interval=2
-cpu.warn=>70:cecb00         # recolour at or above 70
-cpu.crit=>80:cc0403
-cpu.min_w=52                # never jitter when the number gets shorter
-cpu.sep=0                   # no separator: glue the next cell to this one
-cpu.button1=foot -e htop    # click it
-```
-
-| Field | Does |
-| --- | --- |
-| `cmd` | shell command, its output is the text |
-| `interval` | seconds; `0` = once, `-1` = stream every line |
-| `fmt` | `%s` is the output; no printf escaping |
-| `color` `bg` | fixed colours |
-| `warn` `crit` | `>70:cecb00` / `<12:ff2222` on the first number |
-| `min_w` `max_w` `align` | width and placement of the text |
-| `sep` | `0` combines this cell with the next |
-| `hide_empty` | prints nothing = cell and separator disappear |
-| `empty` | text drawn instead of hiding, so the area stays clickable |
-| `gap` | space after the cell; `0` glues it to the next one |
-| `pad` | padding inside the cell |
-| `slim` | folded strip: `auto`, `tick`, `bar`, `clock`, `off` |
-| `slim_min` `slim_max` | value range a gauge maps |
-| `slim_w` | width in the folded strip |
-| `markup` | `<span foreground="#rrggbb">` inside the output |
-| `button1..9` | per-cell click commands |
-| `pos` | `left`, `center` or `right` group |
-| `scroll` | fixed slot, `..` when too long, scrolls on hover |
-
-`swbr_config.example` ships a full set that reproduces a typical swaybar
-script: cmus, volume, docker, mpv, clock, cpu, temperature, battery.
-
-With no cells configured, `status_command` still works the old way.
-
-## Messages
-
-Anything on the system can shout at the bar through a fifo
-(`$XDG_RUNTIME_DIR/swbr.fifo`, override with `msg_fifo=`):
-
-```sh
-swbr --msg "warn: backup running"
-swbr --msg "error: disk full"
-swbr --msg clear
-echo "info: done" > $XDG_RUNTIME_DIR/swbr.fifo
-```
-
-`info:` / `warn:` / `error:` pick the colour. `msg_timeout=8` seconds, `0`
-keeps it until cleared, and clicking it dismisses it.
-
-`msg_target=cmus` hands a cell over to the message while one is up — the
-music title becomes the warning, then goes back to being the title. With no
-target the message is drawn centred on its own. Folded, `msg_flash=1` paints
-the whole strip in the message colour, so an error is visible at 4px.
-
-## Layout
-
-One line places everything:
-
-```
-bar={workspaces,mode||cmus,volume,(docker,mpv),clock,(cpu,temp),(power,battery)}
-```
-
-- `||` splits groups — one part is left, two are left and right, three are
-  left, centre and right.
-- `,` separates items, `(a,b)` glues them with no separator between.
-- Names are your cell names plus the built-ins `workspaces` and `mode`.
-
-It assigns group, order and separators, so keep it last in the config. The
-left group reserves its width first, then the right one is placed against it,
-so nothing ever overlaps.
-
-`min_width=800` makes the bar a floating pill instead of a full-width strip,
-and it **sizes itself to its content**: never narrower than `min_width`,
-never wider than the screen. A cell appearing — charging, a docker list, a
-longer clock — grows the bar instead of being cut off. `min_width=0` goes
-back to spanning the whole output. `align_x=center|left|right` places it.
-
-## Buttons that stay put
-
-A cell that prints nothing disappears — fine for docker, wrong for a media
-control you want to click. Two fields fix it:
-
-- `empty=♪` draws a placeholder instead of hiding, so the area and its click
-  bindings survive.
-- `gap=0` glues a cell to the next one; with a `bg` on both, they render as
-  one continuous box.
-
-The shipped config uses this for cmus: the title is a scrolling text cell,
-the transport controls are their own cell right next to it. The controls can
-never be truncated away by a long title, and when cmus is not running the
-title vanishes while the button stays and starts it.
-
-## Text cells
-
-`NAME.scroll=1` with a `min_w` gives a cell a fixed slot. Longer text is cut
-with `..`, and scrolls through while the pointer sits on it. When the bar
-runs out of room, these are the cells that give up width — nothing else
-moves.
+Needs a running sway session (`$SWAYSOCK`) and any TTF font. `fc-match` is used
+to pick one if it is there.
 
 ## Use
 
-| Action | Result |
+```
+exec_always swbr --replace
+```
+
+`--replace` terminates a bar that is already running and waits for it to go,
+which is what you want on a sway reload. Do not use `pkill swbr` on a separate
+line for this: sway forks each `exec_always` without waiting for it, so the
+kill and the new bar race each other and the kill usually wins — which looks
+exactly like the bar refusing to start.
+
+| | |
 | --- | --- |
-| Left click a workspace | switch to it |
-| Hover + `space` | fold / unfold the bar |
-| `pkill -USR1 swbr` | fold / unfold without the mouse |
-| Click a message | dismiss it |
-| Mouse buttons | run `button1`..`button9` commands |
+| left click a workspace | switch to it |
+| hover the bar, press `space` | fold it into the signal strip, and back |
+| click a cell | run its `button1=` command |
+| `pkill -USR1 swbr` | fold or unfold every bar |
 
-## The folded strip
+The right hand side is made of **cells**: one command each, run on an interval
+or kept running and read line by line.
 
-Four pixels tall and still readable:
+```
+cell=clock
+clock.cmd=date '+%H:%M'
+clock.interval=20
 
-- **Workspaces** keep a fixed slot each, so slot 3 is always workspace 3 —
-  missing ones stay as faint placeholders and nothing shifts around.
-- **A clock cell** (`slim=clock`) becomes twelve dots: hours up to now are
-  lit, the current hour grows with the minutes.
-- **Anything with a percentage, or with warn/crit thresholds**, becomes a
-  gauge: a visible track filled to its value, in that cell's current colour.
-  Battery red still reads as red. `slim_min`/`slim_max` map any range, so a
-  temperature cell can be a gauge over 40..100 C.
-- **A message** takes the whole strip in its colour.
+cell=vol
+vol.cmd=pactl get-sink-volume @DEFAULT_SINK@ | grep -o '[0-9]*%' | head -1
+vol.interval=2
+vol.button1=pavucontrol
 
-Per cell: `slim=auto|tick|bar|clock|off`, plus `slim_min`/`slim_max`.
-Height is `collapsed_px` (5 by default).
+bar={workspaces||vol,clock}
+```
 
-The strip stays **clickable**: workspace slots still switch workspaces, and a
-cell's button bindings still fire. Give a media cell `slim=tick` (not `off`)
-and `slim_w=26`, and it stays on the strip as a play/pause button you can
-find and hit — the screen edge makes a 5px target easy.
+`bar=` is one line that places everything: `||` splits left / center / right,
+`,` separates cells, `(a,b)` glues two together. Keep it last in the config.
 
-For something you must be able to reach without aiming, use the bar-wide
-`button2=` / `button6=` / `button7=` bindings: they fire anywhere no cell
-sits, folded or not. Start folded with `swbr --slim`.
+## Folded
 
-Elements sit in the same order as the expanded bar, and cells glued in the
-layout stay glued here too. `swbr --probe` prints the whole strip left to
-right with each element's mode, colour and fill, which is the fastest way to
-work out which bar is which.
+`space` over the bar folds it to a few pixels. The strip keeps saying
+something.
 
-## Screen modes
+![swbr, folded](screenshot-slim.png)
 
-Sizes are logical pixels, multiplied by the output scale — the bar looks the
-same on a HiDPI screen. `height=0` derives the height from the font, and
-`ui_scale` scales all text at once. One bar per output, each with its own
-workspaces.
+| `NAME.slim=` | on the strip |
+| --- | --- |
+| `tick` | a block, on while the cell has output |
+| `bar` | a gauge, `slim_min`–`slim_max` |
+| `clock` | twelve bars, lit up to the hour — two at 02:00, still two at 02:55 |
+| `presence` | a block in the `running` colour, there only while the program is |
+| `media` | two full-height bars while playing, the same two short and dim when paused, nothing when stopped |
+| `auto` | pick from what the cell prints |
+| `off` | nothing |
+
+A cell keeps its own colour when folded, markup included, so a green "playing"
+glyph stays green down there. `slim_color` overrides it, `slim_color2` is the
+second one a clock uses for its minutes. `slim_on=` says which output counts as
+playing for `slim=media` — it has to match what your command prints. Without
+it swbr guesses from the usual glyphs and the words "playing" and "paused",
+which only helps if your player happens to print one of them.
+
+For cmus there is no guessing:
+
+```
+cell=music
+music.source=cmus
+```
+
+Two cells, if you want the icon separate from the title:
+
+```
+cell=cmusui
+cmusui.source=cmus
+cmusui.cmus_fmt=%i          # just ▶ or ⏸
+
+cell=cmus
+cmus.source=cmus
+cmus.cmus_fmt=%n            # just Artist — Title
+cmus.slim=off
+```
+
+`cmus_fmt` understands `%i` (the icon, which follows the real state), `%n`
+(artist — title, or just the title), `%a`, `%t` and `%s` (the word playing or
+paused). The default is `%i %n`.
+
+That is the whole config, and `source=cmus` sets the command itself — a
+`music.cmd=` from an older config would leave swbr parsing a script's output
+instead of cmus's own, so setting one switches the cell back to a plain
+command. swbr runs `cmus-remote -Q` and reads the `status` line, so playing and paused are facts, not a guess at what a script
+printed. The bar shows `▶ Artist — Title` or `⏸ Artist — Title`, the icon
+following the actual state, and the cell disappears when cmus is stopped or
+not running. Left click toggles pause, middle skips forward, right goes back;
+`music.cmd=`, `music.interval=` and the binds override any of it.
+
+`swbr --probe` prints what it decided for every cell, and the text it decided
+it from:
+
+```
+cell music      iv=2  min_w=0  sep=1  '♪ Boards of Canada — Roygbiv'
+            slim=media  playing=yes  slim_on unset, guessing from the text
+```
+
+`signals=0` turns the whole thing off and leaves a plain strip.
+
+## Load per workspace
+
+A moon in the corner of each workspace button says how much processor time the
+windows on that workspace are using: a sliver when it is idling, whole when something
+is working. It is drawn held back towards the bar's own `dim`, since it is
+secondary to the name. Folded, the workspace slot fills from the bottom
+instead, because a moon that size would be invisible.
+
+swbr asks sway which window belongs to which workspace, reads `/proc`, and
+credits every process to the nearest ancestor that owns a window — so a build
+running in a terminal counts towards the workspace that terminal is on. Each
+process is measured by its own cpu time *plus* the time of the children it has
+already reaped, which is what makes a build show up at all: every compiler
+process lives for a moment and is gone long before the next sample, and its
+time only survives in its parent's totals.
+Anything with no window above it, a daemon or the session itself, belongs to
+no workspace and is left out. The colour runs from `running` through
+`slim_warm` into `urgent`.
+
+```
+ws_cpu=1  ws_cpu_interval=3  ws_cpu_min=4  ws_cpu_full=60
+```
+
+The numbers are written to `$XDG_RUNTIME_DIR/swbr-cpu` so swov can show the
+same thing on its tiles without measuring anything itself — a rate needs two
+samples seconds apart, and swov is only on screen for a moment. `swbr --probe`
+prints what it last measured, and how many windows it found in sway's tree to
+attribute work to — if that count is zero, nothing can ever show.
+
+## Messages
+
+Other programs can shout at the bar, which shows the text in place of a cell:
+
+```sh
+swbr --msg 'warn: battery at 9%'
+swbr --msg clear
+echo 'info: build done' > $XDG_RUNTIME_DIR/swbr.fifo
+```
+
+`msg_target=` says which cell is taken over, `msg_timeout=` for how long.
 
 ## Config
 
-`~/.config/swbr/config`, `key=value`, one per line.
-Every key also works on the command line: `swbr ui_scale=1.2 exclusive=1`.
+`${XDG_CONFIG_HOME:-~/.config}/swbr/config`, `key=value`, `#` comments. Every
+key is also a command line option:
 
 ```sh
-swbr --help          # all keys
-swbr --dump-config   # a config file with every default
-swbr --probe         # outputs, sizes, font metrics, live cell values
-swbr --msg TEXT      # send a message to the running bar
-swbr --slim          # start folded
-swbr --version       # SwBr 0.8.1 (build eaebdc09)  <- md5 of swbr.c
+swbr position=bottom height=32
+swbr --dump-config > ~/.config/swbr/config
+swbr --probe        # outputs, sizes, font metrics and what each cell prints
 ```
 
-See `swbr_config.example` for the commented version.
+`swbr_config.example` lists everything with defaults. The ones worth knowing:
+
+| key | |
+| --- | --- |
+| `position`, `layer`, `height` | where the bar sits and how tall it is |
+| `exclusive` | `1` = reserve the space, `0` = float above the windows |
+| `min_width`, `align_x`, `side_margin` | a floating bar sizes itself to its content |
+| `radius` | corner radius; the corners at the screen edge stay square |
+| `outputs` | which monitors get a bar |
+| `ws_names`, `ws_inset`, `ws_radius` | workspace buttons: numbers or names, pills or blocks |
+| `font`, `font_alt`, `ui_scale`, `text_px` | text |
+| `markup` | the pango subset: `<span foreground=..>`, `<b>`, `&amp;` |
+| `hide_key`, `collapsed_px`, `anim_ms` | folding |
+| `signals`, `slim_ws_slots`, `slim_warm` | what the folded strip shows |
+| `status_command` | i3bar-style status, used when no cells are configured |
+
+### Shared config
+
+Colours and fonts for swbr, swov and appwheel can be set once in
+`${XDG_CONFIG_HOME:-~/.config}/sw/config`, using role names (`surface`,
+`accent`, `hl`, ...) that each program maps onto its own keys. `sw_theme.h`
+lists them all.
+
+Keys written before any section go to all three programs; a `[swbr]` section
+goes to swbr only and takes its own key names as well. The config above is read
+afterwards, so it always wins, and the command line wins over that.
 
 ## Notes
 
-- `hover_keys=1` grabs the keyboard while the pointer is over the bar. That is
-  what lets `space` work without a click first. Keystrokes typed while the
-  pointer rests on the bar go to the bar, not to your window. Set
-  `hover_keys=0` and use `SIGUSR1` if that bothers you.
-- `hide_key` matches the physical key, not the layout.
-- Status markup: `<span foreground=..>`, `<span background=..>`, `<b>`, `<i>`
-  and the XML entities. The i3bar JSON protocol is not supported.
-- No system tray.
-
-## Tested
-
-- Builds clean with `-Wall -Wextra`. `--version` carries the md5 of the
-  source, so you always know which build is running.
-- Config parser: inline comments stripped, `#` inside quoted command text
-  kept, verified against the shipped example.
-- Vertical centering checked at scale 1 and 2: digits sit equally far from
-  both edges.
-- Merged backgrounds verified pixel by pixel: no bare bar shows between two
-  glued cells, so the pair reads as one panel.
-- Media glyphs checked against the font before shipping them: `U+23F8` and
-  the rest of that block are missing from DejaVu, so the config uses glyphs
-  that exist.
-- The folded paint path is now the same code the compositor gets, run
-  headless in tests: the music button lands at 582..608 in its own colour
-  with its binding attached, and a middle click anywhere else falls through
-  to the bar-wide binding.
-- Self-sizing checked across states: 800px idle, 1217px with charging, temp
-  and a docker list, and capped at the 1920px screen when content overflows.
-- Folded strip rendered and sampled pixel by pixel: workspace slots, clock
-  dots, and gauge fills matching their values (47%, 63%, 60%, 88%) against a
-  track that is actually visible.
-- cmus split checked both ways: idle leaves only the button and its click
-  binding, playing keeps the controls at full width beside a truncated title.
-- Focused workspace checked pixel by pixel: solid `cb9b00` from the top row
-  to the bottom row, square corners, and the baseline lift is exactly 2px.
-- Layout DSL parsed and rendered: groups, glued items, hit boxes measured on
-  an 800px bar — workspaces and cells no longer overlap, the last cell lands
-  exactly on the right padding, and a hovered text cell scrolls.
-- Messages tested end to end: fifo round trip, level parsing, cell takeover
-  and hand-back, and the centred-group layout landing on the bar's midpoint.
-- Markup parser, glyph cache, text metrics and the rounded-rect rasterizer
-  run under ASan/UBSan against a real status line: no leaks, no overruns,
-  correct premultiplied output, square top edge, rounded bottom corners.
-- `--dump-config` output re-parses without warnings.
-- Cells tested end to end: config parse, process spawn and reap, thresholds,
-  hidden cells dropping their separators, `sep=0` grouping, `min_w`, and the
-  resulting layout — under ASan/UBSan.
-- `make`, `make debug` and `make clean` run clean.
-- Not yet run against a live compositor — that part is yours.
+- Talks to the sway IPC socket directly: no `swaymsg`, no `jq`.
+- One bar per output, each with its own surface and buffer.
+- Text is rasterised in software into an ARGB32 buffer — no GPU, no SDL.
+- `hover_keys=1` grabs the keyboard only while the pointer is over the bar,
+  which is what makes `hide_key` work without clicking first.
+- A cell with `interval=-1` keeps its command running and takes every line it
+  prints, so a script can push updates the moment they happen.

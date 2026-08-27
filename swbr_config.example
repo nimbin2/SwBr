@@ -1,0 +1,258 @@
+# SwBr config  —  ~/.config/swbr/config
+# One key=value per line. '#' starts a comment. Blank lines are ignored.
+# Every key here also works on the command line (key=value or --key=value);
+# command-line values win over the file. See `swbr --help` for the list.
+#
+# Inline comments after a value are stripped, but a '#' inside quotes is not,
+# so foreground="#19cb00" inside a command is safe.
+#
+# All sizes are LOGICAL pixels: swbr multiplies them by the output scale,
+# so the bar keeps its size on a HiDPI screen. ui_scale scales the text on
+# top of that, and height=0 derives the height from the font.
+
+# --- placement ---
+layer=top          # background | bottom | top | overlay
+                   # top floats above tiled windows but below fullscreen ones;
+                   # overlay stays above fullscreen too
+position=top       # top | bottom
+height=0           # 0 = derive from the font size
+exclusive=0        # 0 = float above the windows, they keep the whole screen
+                   # 1 = reserve the space, windows tile below the bar
+margin=0           # gap to the screen edge
+side_margin=0      # gap left and right
+min_width=800      # 0 = span the whole output. Otherwise the bar floats and
+                   # sizes itself to its content: never narrower than this,
+                   # never wider than the screen. Cells appearing (charging,
+                   # docker) grow it instead of being cut off
+align_x=center     # where the floating bar sits: center | left | right
+radius=10          # corner radius. The two corners that touch the screen edge
+                   # stay square, so the bar sits flush against it
+outputs=           # comma separated output names, empty = one bar per output
+
+# --- workspaces ---
+ws_names=0         # 0 = number only ("3" out of "3:web"), 1 = the full name
+ws_pad=11
+ws_gap=4
+ws_min_w=0
+ws_inset=0         # gap above and below the buttons. 0 = the button spans
+                   # the full bar height, top to bottom
+ws_radius=0        # 0 = square corners. -1 = follow radius, or a full pill
+                   # when ws_inset > 0
+ws_click=1
+scroll_workspace=0
+mode_show=1        # show the binding mode (resize, ..)
+
+# --- text ---
+# By default swbr uses the desktop's monospace font (via fontconfig).
+# font=DejaVu Sans Mono
+# font_alt=Noto Sans Symbols 2   # for glyphs the main font lacks
+ui_scale=1.0       # master text size. 1.3 = bigger, 0.85 = smaller
+text_px=19         # status text
+ws_px=19           # workspace labels
+text_y=-2          # nudge every baseline, logical px, negative = up
+pad_x=12           # padding at the left end
+pad_right=20       # padding at the right end, so the last cell can breathe
+scroll_speed=45    # text cells: logical px per second while hovered
+scroll_pause=900   # ms held at each end before scrolling
+
+# ---------------------------------------------------------------------------
+# CELLS — the right hand side
+#
+#   cell=NAME          declares a cell. The order of these lines is the order
+#                      the cells appear in, left to right.
+#   NAME.cmd=...       shell command; whatever it prints is the cell text.
+#                      Print nothing and the cell disappears, separator too.
+#   NAME.interval=2    seconds between runs. 0 = run once at start,
+#                      -1 = keep the command running and take every line.
+#   NAME.fmt=%s C      %s is replaced by the output. No printf escaping:
+#                      a % in here is just a %.
+#   NAME.color=        text colour        NAME.bg=        cell background
+#   NAME.warn=>70:cecb00                  NAME.crit=<12:ff2222
+#                      recolour when the first number in the output is at or
+#                      above (>) / at or below (<) the threshold
+#   NAME.min_w=280     keep this width even when the text is shorter
+#   NAME.max_w=0       clip beyond this width
+#   NAME.align=right   left | center | right, inside min_w
+#   NAME.sep=0         do not draw a separator after this cell — that is how
+#                      two cells are combined into one group
+#   NAME.empty=TEXT    drawn instead of hiding when the command prints
+#                      nothing — keeps the cell's area clickable
+#   NAME.gap=          space after this cell, overrides cell_gap. 0 glues it
+#                      to the next one: equal bg colours merge into one box
+#   NAME.pad=0         padding inside the cell, left and right
+#   NAME.slim=auto     folded strip: auto | tick | bar | clock | off
+#   NAME.slim_min=0    the value range a gauge maps, so a temperature or a
+#   NAME.slim_max=100  load average can be a gauge as well as a percent
+#   NAME.markup=1      the output may use <span foreground="#rrggbb">..</span>
+#   NAME.button2=CMD   click the cell (1 left, 2 middle, 3 right, 4/5 wheel)
+# ---------------------------------------------------------------------------
+
+cell_gap=14
+cell_inset=3       # gap above and below a cell background
+cell_radius=5      # corner radius of a cell background
+separator=│
+separator_color=3a4654ff
+
+# --- messages ---------------------------------------------------------------
+# Anything can shout at the bar:
+#     swbr --msg "warn: backup running"
+#     swbr --msg "error: disk full"
+#     swbr --msg clear
+#     echo "info: hello" > $XDG_RUNTIME_DIR/swbr.fifo
+# While a message is up it takes over the cmus cell, so the title turns into
+# the warning and turns back into the title afterwards. Click it to dismiss.
+msg_target=cmus
+msg_timeout=8      # seconds; 0 = stays until cleared
+msg_flash=1        # folded bar turns fully into the message colour
+msg_info=89afc4
+msg_warn=cb9b00
+msg_error=e0533c
+
+# --- cmus: two cells glued into one box -------------------------------------
+# The title is a text cell: cut with ".." and scrolls while hovered. The
+# controls are their OWN cell so a long title can never truncate them away,
+# and they keep a fixed clickable area when nothing plays (empty=).
+# Both share one background: same bg + gap=0 merges them into a single box.
+# Note: the U+23Fx media glyphs (pause, stop) are missing from most mono
+# fonts, so the icon is derived here from glyphs that actually exist.
+cell=cmus
+cmus.cmd=pgrep -x cmus >/dev/null || exit 0; cmus_control title-short | tr -d '<>&'
+cmus.interval=2
+cmus.scroll=1      # text cell: cut with ".." and scroll it while hovered
+cmus.min_w=210     # fixed slot, so nothing else on the bar ever shifts
+cmus.align=left
+cmus.pad=10        # breathing room inside the background box
+cmus.bg=ffffff14   # a faint lighter panel, not a solid block
+cmus.gap=0         # glued to the controls: one continuous background
+cmus.sep=0
+cmus.slim=off      # the title says nothing at five pixels
+cmus.button1=pgrep -x cmus >/dev/null && cmus_control toggle || foot -e cmus
+cmus.button2=cmus_control toggle
+cmus.button4=cmus_control prev
+cmus.button5=cmus_control next
+
+cell=cmusui
+cmusui.cmd=pgrep -x cmus >/dev/null || exit 0; case "$(cmus_control status 2>/dev/null)" in playing) printf '❚❚';; paused) printf '▶';; stopped) printf '■';; *) printf '▶';; esac
+cmusui.interval=2
+cmusui.empty=♪     # cmus not running: still a button, click it to start
+cmusui.min_w=38    # never shrinks, never truncates
+cmusui.align=center
+cmusui.pad=4
+cmusui.bg=ffffff14
+cmusui.color=e8b81a    # a touch brighter than cb9b00: small glyph on a dark
+                       # panel reads darker than a big filled workspace block
+cmusui.slim=tick   # stays on the folded strip as a button you can click
+cmusui.button1=pgrep -x cmus >/dev/null && cmus_control toggle || foot -e cmus
+cmusui.button2=cmus_control toggle
+cmusui.button4=cmus_control prev
+cmusui.button5=cmus_control next
+
+# --- volume ----------------------------------------------------------------
+cell=volume
+volume.cmd=alsa_control volume get
+volume.interval=2
+volume.button2=alsa_control mute toggle
+volume.slim=bar
+
+# --- docker and mpv share one group: docker.sep=0 joins them ---------------
+cell=docker
+docker.cmd=pgrep -x dockerd >/dev/null || exit 0; docker ps --format '{{.Image}}' | sed 's/:.*//' | xargs
+docker.interval=10
+docker.color=19cb00
+docker.sep=0
+
+cell=mpv
+mpv.cmd=pgrep -x mpv >/dev/null || exit 0; ws=$(swaymsg -t get_workspaces | jq -r '.[] | select(.representation != null) | select(.representation | test("mpv")) | .name' | paste -sd'|'); [ -n "$ws" ] && printf '<span foreground="#19cb00">mpv </span><span foreground="#3E98E7">[%s]</span>' "$ws" || printf '<span foreground="#cecb00">mpv</span>'
+mpv.interval=3
+
+# --- clock -----------------------------------------------------------------
+cell=clock
+clock.cmd=date '+<span foreground="#00ffff">%H:%M</span>  %a %d.%m'
+clock.interval=5
+clock.slim=clock   # twelve dots: hours lit, the current one grows with minutes
+
+# --- cpu load and temperature, joined --------------------------------------
+cell=cpu
+cpu.cmd=cpu_in_percent
+cpu.fmt=%s%
+cpu.interval=2
+cpu.color=e1eeff
+cpu.warn=>70:cecb00
+cpu.crit=>80:cc0403
+cpu.min_w=52
+cpu.slim=bar       # a gauge in the folded strip, 0..100%
+cpu.sep=0
+
+cell=temp
+temp.cmd=t=$(cpu_temp); [ "${t%%.*}" -ge 70 ] 2>/dev/null && printf '%s°C' "$t"
+temp.interval=5
+temp.warn=>70:cecb00
+temp.crit=>85:cc0403
+temp.slim=bar      # a gauge too, but degrees are not percent:
+temp.slim_min=40   # so map 40..100 C onto the gauge
+temp.slim_max=100
+
+# --- battery: draw and remaining time, then capacity, joined ---------------
+cell=power
+power.cmd=b=/sys/class/power_supply/BAT0; grep -q Discharging $b/status || exit 0; awk -v e="$(cat $b/energy_now)" -v p="$(cat $b/power_now)" 'BEGIN{if(p>0)printf "%.2fW %.1fh", p/1000000, e/p}'
+power.interval=10
+power.color=b3c0cd
+power.sep=0
+
+cell=battery
+battery.cmd=cat /sys/class/power_supply/BAT0/capacity
+battery.fmt=%s%
+battery.interval=10
+battery.color=e1eeff
+battery.warn=<30:cecb00
+battery.crit=<12:ff2222
+battery.slim=bar
+
+# --- folding ---------------------------------------------------------------
+# Put the pointer over the bar and press the key: the bar rolls up into a thin
+# strip. Press it again to roll it back out.
+hide_key=space     # matched by physical key, not by layout
+hover_keys=1       # grab the keyboard while the pointer is over the bar.
+                   # That is what makes hide_key work without clicking first.
+collapsed_px=5
+anim_ms=120
+signals=1          # the folded strip still says something: every workspace
+                   # keeps a fixed slot on the left (slot 3 is always
+                   # workspace 3), the clock becomes twelve dots, and cells
+                   # with a percentage become little gauges
+slim_ws_slots=10   # at most this many workspace slots
+start_collapsed=0  # 1 = start folded. Command line: swbr --slim
+# folds or unfolds every bar without the mouse:  pkill -USR1 swbr
+
+# --- mouse (anywhere on the bar; cell bindings win) ------------------------
+# button2=cmus_control toggle
+
+# ---------------------------------------------------------------------------
+# LAYOUT — one line that places everything. Keep it last: it assigns group,
+# order and separators, overriding pos= and sep= above.
+#
+#   ||   splits groups. One part = left only, two = left and right,
+#        three = left, center, right.
+#   ,    separates items.
+#   (..) glues items together with no separator between them.
+#   names are cell names plus the built-ins "workspaces" and "mode".
+# ---------------------------------------------------------------------------
+bar={workspaces,mode||(cmus,cmusui),volume,(docker,mpv),clock,(cpu,temp),(power,battery)}
+
+# --- colors: #rrggbb or #rrggbbaa ------------------------------------------
+bg=26313fe6         # the bar itself
+text=e1eeffff       # default cell colour      alias: statusline
+dim=5a6b7aff
+accent=89afc4ff     # visible-but-not-focused workspace tick
+hl=cb9b00ff         # focused workspace tick in the folded strip
+urgent=e0533cff
+ws_bg=00000000      # inactive button: nothing, the bar shows through
+ws_fg=b3c0cdff
+ws_focused_bg=cb9b00ff   # the appwheel orange
+ws_focused_fg=141414ff
+ws_visible_bg=3c4a5cff
+ws_visible_fg=e1eeffff
+ws_urgent_bg=e0533cff
+ws_urgent_fg=141414ff
+mode_bg=cb9b00ff
+mode_fg=141414ff

@@ -122,7 +122,9 @@ msg_error=e0533c
 # Note: the U+23Fx media glyphs (pause, stop) are missing from most mono
 # fonts, so the icon is derived here from glyphs that actually exist.
 cell=cmus
-cmus.cmd=pgrep -x cmus >/dev/null || exit 0; cmus_control title-short | tr -d '<>&'
+cmus.source=cmus   # swbr runs cmus-remote itself: no script, and playing vs
+                   # paused is read from cmus rather than guessed
+cmus.cmus_fmt=%n   # just Artist — Title; %i is the icon, %a %t %s also work
 cmus.interval=2
 cmus.scroll=1      # text cell: cut with ".." and scroll it while hovered
 cmus.min_w=210     # fixed slot, so nothing else on the bar ever shifts
@@ -138,22 +140,18 @@ cmus.button4=cmus_control prev
 cmus.button5=cmus_control next
 
 cell=cmusui
-cmusui.cmd=pgrep -x cmus >/dev/null || exit 0; case "$(cmus_control status 2>/dev/null)" in playing) printf '<span foreground="#2fbf71">❚❚</span>';; paused) printf '<span foreground="#e8b81a">▶</span>';; *) printf '<span foreground="#5a6b7a">■</span>';; esac
+cmusui.source=cmus  # the same source, laid out as just the icon
+cmusui.cmus_fmt=%i  # ▶ while playing, ⏸ while paused, following the real state
 cmusui.interval=2
 cmusui.empty=♪     # cmus not running: still a button, click it to start
 cmusui.min_w=38    # never shrinks, never truncates
 cmusui.align=center
 cmusui.pad=4
 cmusui.bg=ffffff14
-cmusui.color=e8b81a    # fallback; the command colours itself per state, and
-                       # the folded strip picks that colour up, so a green
-                       # block means playing and a grey one means stopped
-cmusui.slim=media  # folded: TWO bars while playing, one dim block when not.
-                   # A shape, not another coloured block among gauges.
-cmusui.slim_on=❚   # THIS is what tells it "playing": the output must contain
-                   # this text. It matches the ❚❚ printed above. If you change
-                   # the command to print your own icon, change this too, or
-                   # the strip will always show the idle block.
+cmusui.color=e8b81a
+cmusui.slim=media  # folded: TWO full bars while playing, the same two short
+                   # and dim when paused, nothing when cmus is stopped.
+                   # source=cmus knows which, so slim_on is not needed.
 cmusui.slim_w=26   # wider than the other ticks, so it is easy to find and hit
 cmusui.button1=pgrep -x cmus >/dev/null && cmus_control toggle || foot -e cmus
 cmusui.button2=cmus_control toggle
@@ -182,15 +180,6 @@ mpv.cmd=pgrep -x mpv >/dev/null || exit 0; ws=$(swaymsg -t get_workspaces | jq -
 mpv.interval=3
 mpv.slim=presence      # same for mpv: started something in the background?
 mpv.slim_color=3ea6ff  # its own colour, so you can tell the two apart
-
-# --- cmus, without a script ------------------------------------------------
-# swbr runs cmus-remote itself, so playing and paused are facts. It fills in
-# the command, the interval, slim=media and the mouse binds; override any of
-# them below if you want something else.
-# cell=music
-# music.source=cmus
-# music.cmus_fmt=%i %n   # %i icon, %n artist — title, %a, %t, %s playing|paused
-#                        # two cells work too: one with %i, one with %n
 
 # --- clock -----------------------------------------------------------------
 cell=clock
@@ -235,8 +224,15 @@ power.sep=0
 # The marker at the end tells the folded strip which way it is going:
 # + charging, - discharging, = full. In the full bar it reads as ⚡ or nothing.
 cell=battery
-battery.cmd=b=/sys/class/power_supply/BAT0; c=$(cat $b/capacity); case "$(cat $b/status)" in Charging) printf '%s%%+' "$c";; Full) printf '%s%%=' "$c";; *) printf '%s%%-' "$c";; esac
-battery.markup=1
+battery.source=battery  # reads /sys itself: 83+ filling, 83- draining, no
+                   # sign when full
+# battery.bat_path=/sys/class/power_supply/BAT1   # if yours is not BAT0, or
+                   # you have two. Left out, swbr takes the first thing with a
+                   # capacity file, preferring one called BAT*
+# battery.src_fmt=%c%i %w %h   # %c capacity, %i sign, %w watts now, %h hours
+                   # left, %s the word. This one reads "83- 21.5W 1.7h"
+# battery.cmd=...   # setting a command switches the cell back to your own
+                   # script; source= and cmd= are the two ways, never both
 battery.interval=10
 battery.color=e1eeff
 battery.warn=<30:cecb00
@@ -288,6 +284,9 @@ dim=5a6b7aff
 accent=89afc4ff     # visible-but-not-focused workspace tick
 hl=cb9b00ff         # focused workspace tick in the folded strip
 urgent=e0533cff
+ws_other=1         # 1 = also show the workspaces of your other monitors, as
+                   # short pills on the baseline so they are clearly not this
+                   # screen's
 ws_cpu=1           # a dot on each workspace button showing how much
                    # processor time the windows on it are using. Folded, the
                    # workspace slot fills from the bottom instead

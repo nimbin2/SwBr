@@ -74,7 +74,7 @@ something.
 | --- | --- |
 | `tick` | a block, on while the cell has output |
 | `bar` | a gauge, `slim_min`–`slim_max` |
-| `clock` | twelve bars, lit up to the hour — two at 02:00, still two at 02:55 |
+| `clock` | twelve bars, lit up to the hour — two at 02:00, still two at 02:55, softer before noon |
 | `presence` | a block in the `running` colour, there only while the program is |
 | `media` | two full-height bars while playing, the same two short and dim when paused, nothing when stopped |
 | `auto` | pick from what the cell prints |
@@ -130,13 +130,60 @@ cell music      iv=2  min_w=0  sep=1  '♪ Boards of Canada — Roygbiv'
 
 `signals=0` turns the whole thing off and leaves a plain strip.
 
+## Battery
+
+```
+cell=battery
+battery.source=battery
+```
+
+Reads capacity and status out of `/sys/class/power_supply` itself: `83+` while
+it is filling, `83-` while it is draining, and no sign at all when it is full,
+since nothing is happening. The sign
+carries the direction, so there is no percent sign spending width. `slim=bar`
+and the 0–100 range are set for you.
+
+Not every machine calls it `BAT0`, so it takes the first thing with a
+`capacity` file, preferring one named `BAT*`. Point it elsewhere with
+`battery.bat_path=/sys/class/power_supply/BAT1` — which is also how you pick
+one of two — and lay it out with `battery.src_fmt=`: `%c` capacity, `%i` the
+sign, `%w` what it is drawing right now in watts, `%h` how long that leaves,
+`%s` the word. `battery.src_fmt=%c%i %w %h` gives `83- 21.5W 1.7h`.
+
+The watts and the hours come from `energy_now`/`power_now` where the kernel
+reports those, and from `charge_now`/`current_now`/`voltage_now` where it does
+not; whichever pair exists gives both numbers, and they are simply left empty
+when neither does.
+
+None of this takes anything away. Setting `battery.cmd=` switches the cell
+back to your own script, as with any other cell; `source=` and `cmd=` are the
+two ways of filling a cell, and whichever comes last in the config wins.
+
+## Other monitors
+
+`ws_other=1` adds the workspaces from your other screens to the bar, drawn as
+short pills sitting on the bar's bottom edge at a little over half height, in
+type a fifth smaller and a little see-through. It is on in the shipped config.
+
+Folded, they take a slot like any other workspace but never this screen's
+emphasis — focused on the other monitor is not focused here, so the brightest
+they ever get is a soft accent. They stay
+readable and clickable, and nothing about them looks like it belongs to this
+screen.
+
 ## Load per workspace
 
-A moon in the corner of each workspace button says how much processor time the
-windows on that workspace are using: a sliver when it is idling, whole when something
-is working. It is drawn held back towards the bar's own `dim`, since it is
-secondary to the name. Folded, the workspace slot fills from the bottom
-instead, because a moon that size would be invisible.
+A column of dots up the right edge of each workspace button says how much
+processor time the windows on that workspace are using: one lit when it is
+idling, all of them when something is working. Dots rather than a solid fill,
+so the button's own colour still reads through the gaps — six of them on a
+30 px bar, three in the folded strip, where the same dots run up the workspace
+slot.
+
+They keep one colour — `accent`, held back towards `dim` — and only tip
+towards `urgent` when a workspace is really pinned, so it is the count and not
+the hue that carries the load. `hl` is what paints the focused workspace, so
+nothing here goes near it.
 
 swbr asks sway which window belongs to which workspace, reads `/proc`, and
 credits every process to the nearest ancestor that owns a window — so a build

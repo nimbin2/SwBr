@@ -840,17 +840,49 @@ static bool proc_stat_of(int pid, int *ppid,
     return true;
 }
 
-static int cpu_ws_of_pid(int pid)
+/* The walk used to stop after twelve hops and re-read /proc at every one. A
+ * real build is deeper than that — cc1 < gcc < make < make < make < bash <
+ * bash < helper < helper < bash < python3 < terminal is twelve on its own —
+ * so the compiler was declared homeless while the make above it was found,
+ * and the workspace flickered between the truth and nothing. The sample we
+ * have already read holds every pid and ppid, so the walk is done in memory,
+ * as deep as it needs, and each answer is remembered. */
+static int  *cpu_ws_memo;                       /* per index in the sample */
+
+static int cpu_sample_index(const ProcSample *v, int n, int pid)
 {
-    for (int hop = 0; hop < 12 && pid > 1; ++hop) {
-        for (int i = 0; i < cpu_nwin; ++i)
-            if (cpu_win[i].pid == pid) return cpu_win[i].ws;
-        int ppid; unsigned long long own, chld;
-        if (!proc_stat_of(pid, &ppid, &own, &chld)) return -1;
-        pid = ppid;
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (v[mid].pid == pid) return mid;
+        if (v[mid].pid < pid) lo = mid + 1;
+        else                  hi = mid - 1;
     }
     return -1;
 }
+
+static int cpu_ws_of_index(const ProcSample *v, int n, int idx)
+{
+    int chain[64], depth = 0;
+    int ws = -1;
+
+    while (idx >= 0 && depth < (int)(sizeof chain / sizeof *chain)) {
+        if (cpu_ws_memo[idx] != -2) { ws = cpu_ws_memo[idx]; break; }
+        chain[depth++] = idx;
+
+        int pid = v[idx].pid;
+        bool found = false;
+        for (int i = 0; i < cpu_nwin; ++i)
+            if (cpu_win[i].pid == pid) { ws = cpu_win[i].ws; found = true; break; }
+        if (found) break;
+
+        if (v[idx].ppid <= 1) break;
+        idx = cpu_sample_index(v, n, v[idx].ppid);
+    }
+    for (int i = 0; i < depth; ++i) cpu_ws_memo[chain[i]] = ws;
+    return ws;
+}
+
 
 /* every view in sway's tree, as pid -> the workspace it sits on */
 static void cpu_collect_windows(const JV *node, int ws_idx)
@@ -929,6 +961,14 @@ static void cpu_sample(void)
     }
     closedir(d);
 
+    for (int i = 1; i < n; ++i) {                /* insertion sort: /proc is
+                                                    nearly ordered already */
+        ProcSample tmp = now[i];
+        int j = i - 1;
+        while (j >= 0 && now[j].pid > tmp.pid) { now[j + 1] = now[j]; --j; }
+        now[j + 1] = tmp;
+    }
+
     double at = now_ms() / 1000.0;
     double dt = at - cpu_last_at;
 
@@ -940,10 +980,14 @@ static void cpu_sample(void)
 
         double used[MAX_WORKSPACES] = { 0 };
         cpu_top_n = 0;
+
+        free(cpu_ws_memo);
+        cpu_ws_memo = (int *)xmalloc((size_t)n * sizeof *cpu_ws_memo);
+        for (int i = 0; i < n; ++i) cpu_ws_memo[i] = -2;
+
         for (int i = 0; i < n; ++i) {
-            const ProcSample *was = NULL;
-            for (int j = 0; j < cpu_prev_n; ++j)          /* same order, mostly */
-                if (cpu_prev[j].pid == now[i].pid) { was = &cpu_prev[j]; break; }
+            int pj = cpu_sample_index(cpu_prev, cpu_prev_n, now[i].pid);
+            const ProcSample *was = pj >= 0 ? &cpu_prev[pj] : NULL;
 
             unsigned long long total = now[i].own + now[i].chld, before = 0;
             if (was && was->own + was->chld <= total) before = was->own + was->chld;
@@ -951,7 +995,7 @@ static void cpu_sample(void)
                time belongs to this window */
             unsigned long long delta = total - before;
 
-            int ws = cpu_ws_of_pid(now[i].pid);
+            int ws = cpu_ws_of_index(now, n, i);
             now[i].ws = ws;
             if (!delta) continue;
             if (ws >= 0 && ws < MAX_WORKSPACES)
@@ -977,10 +1021,7 @@ static void cpu_sample(void)
          * the part of it that ran before the last sample. Take that back, or
          * every exit is counted twice. */
         for (int j = 0; j < cpu_prev_n; ++j) {
-            bool alive = false;
-            for (int i = 0; i < n; ++i)
-                if (now[i].pid == cpu_prev[j].pid) { alive = true; break; }
-            if (alive) continue;
+            if (cpu_sample_index(now, n, cpu_prev[j].pid) >= 0) continue;
             int ws = cpu_prev[j].ws;
             if (ws >= 0 && ws < MAX_WORKSPACES)
                 used[ws] -= (double)(cpu_prev[j].own + cpu_prev[j].chld) / (double)hz;
@@ -1013,7 +1054,7 @@ static void cpu_sample(void)
  * `NAME.source=cmus` is the exception: swbr runs cmus-remote itself and reads
  * the answer, so whether something is playing is a fact rather than a guess
  * at what a script happened to print. */
-enum { SRC_CMD, SRC_CMUS };
+enum { SRC_CMD, SRC_CMUS, SRC_BATTERY };
 enum { PS_UNKNOWN = -1, PS_STOPPED = 0, PS_PAUSED = 1, PS_PLAYING = 2 };
 typedef struct {
     char  name[32];
@@ -1024,6 +1065,7 @@ typedef struct {
     char  slim_on[64];           /* output containing this = the "on" state */
     int   source;                /* SRC_CMD, or a player swbr knows itself   */
     char  src_fmt[128];          /* how a known player is laid out           */
+    char  src_path[256];         /* where to read it from, when that varies  */
     int   state;                 /* what that player is doing: PS_*          */
     int   gap;                   /* -1 = cell_gap */
     int   pad;                   /* inner padding, left and right */
@@ -1098,6 +1140,7 @@ typedef struct {
 
     /* colors */
     Col bg, text, dim, accent, hl, urgent, outline, running, slim_warm;
+    int ws_other;                /* show other monitors' workspaces too  */
     int ws_cpu;                  /* the load dot on a workspace button   */
     int ws_cpu_interval;         /* seconds between samples              */
     float ws_cpu_min, ws_cpu_full;  /* below min nothing shows; full = the
@@ -1172,6 +1215,7 @@ static void config_defaults(Config *c)
     c->outline       = (Col){ 0x0a, 0x0e, 0x14, 0x99 };
     c->ws_bg         = (Col){ 0x1e, 0x27, 0x33, 0x00 };
     c->ws_fg         = (Col){ 0xb3, 0xc0, 0xcd, 0xff };
+    c->ws_other        = 0;
     c->ws_cpu          = 1;
     c->ws_cpu_interval = 3;
     c->ws_cpu_min      = 4.0f;
@@ -1243,6 +1287,8 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
     else if (!strcmp(k, "slim_on")) str_set(e->slim_on, sizeof(e->slim_on), v);
     else if (!strcmp(k, "src_fmt") || !strcmp(k, "cmus_fmt"))
         str_set(e->src_fmt, sizeof(e->src_fmt), v);
+    else if (!strcmp(k, "src_path") || !strcmp(k, "bat_path"))
+        str_set(e->src_path, sizeof(e->src_path), v);
     else if (!strcmp(k, "source")) {
         if (!strcasecmp(v, "cmus")) {
             e->source = SRC_CMUS;
@@ -1256,6 +1302,13 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
             if (!*e->bind[1])  str_set(e->bind[1], sizeof(e->bind[1]), "cmus-remote -u");
             if (!*e->bind[2])  str_set(e->bind[2], sizeof(e->bind[2]), "cmus-remote -n");
             if (!*e->bind[3])  str_set(e->bind[3], sizeof(e->bind[3]), "cmus-remote -r");
+        } else if (!strcasecmp(v, "battery") || !strcasecmp(v, "bat")) {
+            e->source = SRC_BATTERY;
+            /* it reads /sys itself; the command only paces it */
+            str_set(e->cmd, sizeof(e->cmd), "true");
+            if (!e->interval) e->interval = 20;
+            if (e->slim == SLIM_AUTO) e->slim = SLIM_BAR;
+            if (e->slim_max <= e->slim_min) { e->slim_min = 0; e->slim_max = 100; }
         } else {
             e->source = SRC_CMD;
         }
@@ -1389,6 +1442,7 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "outline")) parse_color(v, &c->outline);
     else if (!strcmp(k, "ws_bg")) parse_color(v, &c->ws_bg);
     else if (!strcmp(k, "ws_fg")) parse_color(v, &c->ws_fg);
+    else if (!strcmp(k, "ws_other")) c->ws_other = atoi(v);
     else if (!strcmp(k, "ws_cpu")) c->ws_cpu = atoi(v);
     else if (!strcmp(k, "ws_cpu_interval")) c->ws_cpu_interval = atoi(v);
     else if (!strcmp(k, "ws_cpu_min")) c->ws_cpu_min = (float)atof(v);
@@ -2448,11 +2502,120 @@ static void cmus_parse(Cell *e)
     if (t != e->out) memmove(e->out, t, strlen(t) + 1);
 }
 
+/* capacity and status under /sys/class/power_supply: "83+" while it is
+ * filling, "83-" while it is not. The sign says the direction, the number says the
+ * charge, and neither needs a script. */
+/* one number out of a sysfs file, or -1 */
+static double bat_num(const char *base, const char *leaf)
+{
+    char path[420], buf[64] = "";
+    snprintf(path, sizeof(path), "%s/%s", base, leaf);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1.0;
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1.0; }
+    fclose(f);
+    char *t = trim(buf);
+    if (!*t) return -1.0;
+    return atof(t);
+}
+
+static void battery_read(Cell *e)
+{
+    char base[320] = "";
+
+    if (*e->src_path) {
+        /* Whatever you point it at. Not every machine calls it BAT0 — some
+         * name it CMB0 or macsmc-battery, and a laptop with two has to be
+         * told which one. */
+        str_set(base, sizeof(base), e->src_path);
+    } else {
+        DIR *d = opendir("/sys/class/power_supply");
+        if (!d) { e->out[0] = 0; return; }
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            char probe[400];
+            snprintf(probe, sizeof(probe), "/sys/class/power_supply/%s/capacity",
+                     de->d_name);
+            if (access(probe, R_OK) != 0) continue;   /* not a battery */
+            snprintf(base, sizeof(base), "/sys/class/power_supply/%s", de->d_name);
+            if (!strncasecmp(de->d_name, "BAT", 3)) break;   /* prefer a BAT* */
+        }
+        closedir(d);
+    }
+    if (!*base) { e->out[0] = 0; return; }
+
+    char path[400], cap[32] = "", status[32] = "";
+    snprintf(path, sizeof(path), "%s/capacity", base);
+    FILE *f = fopen(path, "r");
+    if (f) { if (fgets(cap, sizeof(cap), f)) {} fclose(f); }
+    snprintf(path, sizeof(path), "%s/status", base);
+    f = fopen(path, "r");
+    if (f) { if (fgets(status, sizeof(status), f)) {} fclose(f); }
+
+    char *c = trim(cap), *st = trim(status);
+    if (!*c) { e->out[0] = 0; return; }
+
+    /* What it is doing right now, in watts, and how long that leaves. Some
+     * kernels report energy and power, others charge and current; either pair
+     * gives both numbers. */
+    double now_u = bat_num(base, "energy_now"), full_u = bat_num(base, "energy_full");
+    double rate_u = bat_num(base, "power_now"), volt = bat_num(base, "voltage_now");
+    if (now_u < 0) {                              /* the charge/current pair */
+        now_u  = bat_num(base, "charge_now");
+        full_u = bat_num(base, "charge_full");
+        double cur = bat_num(base, "current_now");
+        if (cur >= 0 && volt >= 0) rate_u = cur * volt / 1e6;   /* to µW */
+        if (now_u >= 0 && volt >= 0) { now_u  = now_u  * volt / 1e6;
+                                       full_u = full_u * volt / 1e6; }
+    }
+
+    char watts[32] = "", hours[32] = "";
+    if (rate_u > 0) snprintf(watts, sizeof(watts), "%.1fW", rate_u / 1e6);
+
+    bool full = !strcasecmp(st, "Full");
+    bool up   = full || !strcasecmp(st, "Charging");
+    e->state  = up ? PS_PLAYING : PS_PAUSED;     /* reused: filling or not */
+
+    if (rate_u > 0 && now_u >= 0) {
+        double left_u = up ? (full_u > now_u ? full_u - now_u : 0) : now_u;
+        double h = left_u / rate_u;
+        if (h > 0 && h < 100) snprintf(hours, sizeof(hours), "%.1fh", h);
+    }
+
+    /* %c capacity, %i the sign, %w watts, %h hours left, %s the word.
+     * Full gets no sign at all: nothing is happening, so nothing is said. */
+    const char *sign = full ? "" : up ? "+" : "-";
+    const char *bf = *e->src_fmt ? e->src_fmt : "%c%i";
+    size_t o = 0;
+    for (const char *p = bf; *p && o < sizeof(e->out) - 1; ++p) {
+        const char *ins = NULL;
+        if (*p == '%' && p[1]) {
+            switch (p[1]) {
+            case 'c': ins = c;     break;
+            case 'i': ins = sign;  break;
+            case 'w': ins = watts; break;
+            case 'h': ins = hours; break;
+            case 's': ins = st;    break;
+            case '%': ins = "%";   break;
+            default:  break;
+            }
+        }
+        if (!ins) { e->out[o++] = *p; continue; }
+        ++p;
+        size_t l = strlen(ins);
+        if (o + l >= sizeof(e->out)) l = sizeof(e->out) - 1 - o;
+        memcpy(e->out + o, ins, l);
+        o += l;
+    }
+    e->out[o] = 0;
+}
+
 static void cell_finish(Cell *e)
 {
     e->buf[e->len] = 0;
 
-    if (e->source == SRC_CMUS) { cmus_parse(e); e->len = 0; return; }
+    if (e->source == SRC_CMUS)    { cmus_parse(e);  e->len = 0; return; }
+    if (e->source == SRC_BATTERY) { battery_read(e); e->len = 0; return; }
 
     char *t = trim(e->buf);
     for (char *q = t; *q; ++q) if (*q == '\n' || *q == '\r' || *q == '\t') *q = ' ';
@@ -2799,9 +2962,13 @@ static bool ws_on_bar(Bar *b, Ws *w)
 
 static Ws *ws_by_num(Bar *b, int num)
 {
-    for (int i = 0; i < ws_count; ++i)
-        if (ws_list[i].num == num && ws_on_bar(b, &ws_list[i])) return &ws_list[i];
-    return NULL;
+    Ws *other = NULL;
+    for (int i = 0; i < ws_count; ++i) {
+        if (ws_list[i].num != num) continue;
+        if (ws_on_bar(b, &ws_list[i])) return &ws_list[i];
+        if (cfg.ws_other) other = &ws_list[i];     /* another screen's */
+    }
+    return other;
 }
 
 static int slim_mode(Cell *e)
@@ -2914,11 +3081,15 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
         localtime_r(&t, &tmv);
         int hour = (tmv.tm_hour + 11) % 12 + 1;    /* 1..12, 0:xx reads as 12 */
         float dot = 3.0f * s, gap = 2.0f * s;
-        /* every dot up to the hour, so you count bars instead of finding the
-         * one lit position: 2 bars at 02:00, still 2 at 02:55. Morning uses
-         * the second colour, afternoon the main one, so 1:00 and 13:00 differ. */
-        Col hc = tmv.tm_hour >= 12 ? c
-               : (e->has_slim_color2 ? e->slim_color2 : cfg.accent);
+        /* Every bar up to the hour, so you count them instead of finding the
+         * one lit position: 2 at 02:00, still 2 at 02:55.
+         *
+         * The hours are always the cell's own colour — the clock is cyan in
+         * the bar, so it is cyan down here too. Before noon they are drawn a
+         * little softer, which still separates 1:00 from 13:00 without
+         * swapping to a colour that reads as something else entirely. */
+        Col hc = c;
+        if (tmv.tm_hour < 12) hc.a = (uint8_t)(hc.a * 0.62f);
         for (int i = 0; i < 12; ++i) {
             Col dc = cfg.dim;
             dc.a = 90;
@@ -2929,8 +3100,8 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
         Col mc = e->has_slim_color2 ? e->slim_color2 : cfg.accent;
         mc.a = 200;
         float span = 12.0f * dot + 11.0f * gap;
-        float half = h * 0.5f;
-        fill_rect(cv, x, y + h - half, span * (float)tmv.tm_min / 60.0f, half, mc);
+        float mh = clampf(h * 0.5f + 1.0f * s, 1.0f, h);   /* a pixel more */
+        fill_rect(cv, x, y + h - mh, span * (float)tmv.tm_min / 60.0f, mh, mc);
         return;
     }
     if (mode == SLIM_BAR) {
@@ -2991,17 +3162,29 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
     fill_rect(cv, x, y, w, h, c);
 }
 
-/* A disc filled from the bottom: empty at rest, full when it is working hard.
- * `frac` 0..1 is how much of it is lit. */
-static void fill_moon(Canvas *cv, float cx, float cy, float r, float frac, Col c)
+/* A column of dots rising from the bottom, `frac` of them lit. Dots rather
+ * than a solid fill so whatever is underneath — a workspace pill, the strip's
+ * own colour — still reads through the gaps. */
+static void dot_column(Canvas *cv, float x, float y, float w, float h,
+                       float dot, float gap, float frac, Col c)
 {
-    if (r < 0.5f) return;
-    float top = cy + r - 2.0f * r * clampf(frac, 0.0f, 1.0f);
-    for (float dy = -r; dy <= r; dy += 1.0f) {
-        float y = cy + dy;
-        if (y < top) continue;
-        float half = sqrtf(r * r - dy * dy);
-        fill_rect(cv, cx - half, y, half * 2.0f, 1.0f, c);
+    /* square-ish, and centred in the slot: a dot as wide as the slot is a
+     * stripe, and a column of stripes reads as one solid block */
+    if (w > dot * 1.4f) { x += (w - dot) * 0.5f; w = dot; }
+
+    int n = (int)((h + gap) / (dot + gap));
+    if (n < 2) n = 2;
+    if (n > 12) n = 12;
+
+    int lit = frac <= 0.0f ? 0 : (int)ceilf(frac * (float)n);
+    if (lit > n) lit = n;
+
+    Col dim_c = c;
+    dim_c.a = (uint8_t)(c.a * 0.28f);
+
+    for (int i = 0; i < n; ++i) {
+        float dy = y + h - (float)(i + 1) * dot - (float)i * gap;
+        fill_rect(cv, x, dy, w, dot, i < lit ? c : dim_c);
     }
 }
 
@@ -3018,12 +3201,14 @@ static bool cpu_load_col(int ws_idx, Col *out, float *frac)
             : 1.0f;
     f = clampf(f, 0.0f, 1.0f);
     *frac = f;
-    Col hot = f < 0.5f ? col_mix(cfg.accent, cfg.slim_warm, f * 2.0f)
-                       : col_mix(cfg.slim_warm, cfg.urgent, (f - 0.5f) * 2.0f);
-    /* held back towards the bar's own dim, and never fully opaque: it should
-     * be readable out of the corner of an eye, not competing with the name */
-    *out = col_mix(cfg.dim, hot, 0.6f + 0.4f * f);
-    out->a = (uint8_t)(190 + 65 * f);
+    /* One colour, not a ramp: how much is lit says how busy it is, and the
+     * hue stays out of the way. Orange was a mistake — `hl` paints the
+     * focused workspace, so a busy workspace looked like the current one.
+     * Only a workspace that is really pinned tips towards urgent. */
+    Col hot = f < 0.85f ? cfg.accent
+                        : col_mix(cfg.accent, cfg.urgent, (f - 0.85f) / 0.15f);
+    *out = col_mix(cfg.dim, hot, 0.7f + 0.3f * f);
+    out->a = (uint8_t)(200 + 55 * f);
     return true;
 }
 
@@ -3044,7 +3229,8 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
     int slots = cfg.slim_ws_slots;
     if (slots <= 0) {
         for (int i = 0; i < ws_count; ++i)
-            if (ws_on_bar(b, &ws_list[i]) && ws_list[i].num > slots) slots = ws_list[i].num;
+            if ((ws_on_bar(b, &ws_list[i]) || cfg.ws_other) &&
+                ws_list[i].num > slots) slots = ws_list[i].num;
     }
 
     float tick = 14.0f * s;
@@ -3054,22 +3240,28 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
         Ws *w = ws_by_num(b, i);
         Col c = cfg.dim;
         c.a = 60;                                  /* empty slot: a faint place holder */
+        bool mine = w ? ws_on_bar(b, w) : true;
         if (w) {
             if (w->urgent) c = cfg.urgent;
             else if (w->focused) c = cfg.hl;
             else if (w->visible) c = cfg.accent;
             else { c = cfg.dim; c.a = 170; }
+
+            /* Another screen's workspace is shown, but never with this
+             * screen's emphasis: focused there is not focused here. */
+            if (!mine) {
+                if (w->focused || w->visible) { c = cfg.accent; c.a = 120; }
+                else                          { c = cfg.dim;    c.a = 110; }
+            }
         }
         fill_rect(cv, x, y, tick, h, c);
         if (w) {
             int wi = (int)(w - ws_list);
             Col lc; float lf;
             if (cpu_load_col(wi, &lc, &lf)) {
-                /* the slot is only a few pixels tall, so the load is drawn as
-                 * a lit portion of it rising from the bottom rather than as a
-                 * dot nobody would see */
-                float lh = clampf(h * (0.35f + 0.65f * lf), 1.0f, h);
-                fill_rect(cv, x, y + h - lh, tick, lh, lc);
+                /* Three or four dots up the slot. Filling it solid hid which
+                 * workspace it was, which is the thing the slot is for. */
+                dot_column(cv, x, y, tick, h, 1.0f * s, 1.0f * s, lf, lc);
             }
         }
         if (w && b->hits < MAX_WORKSPACES) {      /* still switchable when folded */
@@ -3131,6 +3323,14 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
  * drawn through the same two-pass code. With ws_inset > 0 they float inside
  * the bar as their own pills instead of being as tall as the bar itself. */
 
+/* A workspace from another screen is drawn smaller, so it has to be measured
+ * smaller too, or the block comes out wider than what is in it. */
+static Font *ws_font(Bar *b, Ws *w, Font *f)
+{
+    if (ws_on_bar(b, w)) return f;
+    return font_get((int)((float)f->px * 0.78f + 0.5f));
+}
+
 static float ws_button_w(Font *f, Ws *w, float s)
 {
     return fmaxf(text_width(f, w->label) + 2.0f * (float)cfg.ws_pad * s,
@@ -3142,8 +3342,10 @@ static float ws_block_w(Font *f, Bar *b, float s)
     float w = 0;
     int n = 0;
     for (int i = 0; i < ws_count; ++i) {
-        if (!ws_on_bar(b, &ws_list[i])) continue;
-        w += ws_button_w(f, &ws_list[i], s);
+        /* the same set the drawing walks, or the block is measured shorter
+         * than it is drawn and the next cell lands on top of it */
+        if (!ws_on_bar(b, &ws_list[i]) && !cfg.ws_other) continue;
+        w += ws_button_w(ws_font(b, &ws_list[i], f), &ws_list[i], s);
         n++;
     }
     if (n > 1) w += (float)(n - 1) * (float)cfg.ws_gap * s;
@@ -3179,32 +3381,46 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
     float base = baseline_for(f, y0, vis, s);
     for (int i = 0; i < ws_count; ++i) {
         Ws *w = &ws_list[i];
-        if (!ws_on_bar(b, w)) continue;
-        float bwid = ws_button_w(f, w, s);
-        float tw = text_width(f, w->label);
+        bool mine = ws_on_bar(b, w);
+        if (!mine && !cfg.ws_other) continue;
+
+        Font *wf = ws_font(b, w, f);
+        float bwid = ws_button_w(wf, w, s);
+        float tw = text_width(wf, w->label);
 
         Col bg = cfg.ws_bg, fg = cfg.ws_fg;
         if (w->urgent)       { bg = cfg.ws_urgent_bg;  fg = cfg.ws_urgent_fg;  }
         else if (w->focused) { bg = cfg.ws_focused_bg; fg = cfg.ws_focused_fg; }
         else if (w->visible) { bg = cfg.ws_visible_bg; fg = cfg.ws_visible_fg; }
 
-        pill(cv, x, y0, vis, bwid, s, rad, col_scale_alpha(bg, fade));
-        text_draw(cv, f, x + (bwid - tw) * 0.5f, base, col_scale_alpha(fg, fade), w->label);
+        /* A workspace on another monitor is drawn as a short pill sitting on
+         * the baseline: still readable, still clickable, and obviously not
+         * one of this screen's. */
+        float bh = mine ? vis : vis * 0.55f;
+        float by = mine ? y0  : y0 + (vis - bh);
+        float bfade = mine ? fade : fade * 0.75f;
+
+        pill(cv, x, by, bh, bwid, s, mine ? rad : rad * 0.6f,
+             col_scale_alpha(bg, bfade));
+        if (mine)
+            text_draw(cv, f, x + (bwid - tw) * 0.5f, base,
+                      col_scale_alpha(fg, fade), w->label);
+        else {
+            /* smaller type, lifted clear of the bottom edge, and a little
+               see-through: it belongs to another screen */
+            float base2 = baseline_for(wf, by, bh, s) - 1.5f * s;
+            text_draw(cv, wf, x + (bwid - tw) * 0.5f, base2,
+                      col_scale_alpha(fg, bfade * 0.72f), w->label);
+        }
 
         Col lc; float lf;
         if (cpu_load_col(i, &lc, &lf)) {
-            /* Top right of the button, big enough to actually see: a dim
-             * whole disc for the outline, then the lit part rising through
-             * it. The pill underneath can be bright orange, so the rim keeps
-             * a dark ring around it. */
-            float r  = clampf(vis * 0.17f, 3.0f * s, 6.0f * s);
-            float mx = x + bwid - r - 3.0f * s, my = y0 + r + 3.0f * s;
-
-            Col ring = cfg.bg; ring.a = 200;
-            fill_moon(cv, mx, my, r + 1.0f * s, 1.0f, col_scale_alpha(ring, fade));
-            Col rim = lc; rim.a = 90;
-            fill_moon(cv, mx, my, r, 1.0f, col_scale_alpha(rim, fade));
-            fill_moon(cv, mx, my, r, 0.2f + 0.8f * lf, col_scale_alpha(lc, fade));
+            /* Up the right edge of the button, the same dots as the folded
+             * strip so the two read as one idea. */
+            float dw  = clampf(2.0f * s, 1.0f, 3.0f);
+            float pad = 3.0f * s;
+            dot_column(cv, x + bwid - dw - pad, by + pad, dw, bh - 2.0f * pad,
+                       2.0f * s, 2.0f * s, lf, col_scale_alpha(lc, bfade));
         }
 
         if (b->hits < MAX_WORKSPACES) {
@@ -4164,6 +4380,12 @@ static void usage(void)
 "                      bars while playing, one dim one when not\n"
 "  NAME.slim_color=    override this cell's colour on the strip. Without it\n"
 "                      the strip reuses the colour the cell's own text has\n"
+"  NAME.source=battery reads capacity and status out of /sys itself and\n"
+"                      prints 83+ while it is filling, 83- while it is not,\n"
+"                      83= when it is full. NAME.bat_path= points it at a\n"
+"                      particular one, NAME.src_fmt= lays it out (%c capacity,\n"
+"                      %i sign, %s the word). NAME.cmd= goes back to your own\n"
+"                      command for any of this\n"
 "  NAME.source=cmus    swbr runs cmus-remote itself: playing and paused are\n"
 "                      read from it rather than guessed from the text, and\n"
 "                      the command, interval, slim=media and the mouse binds\n"
@@ -4357,7 +4579,36 @@ static void probe_report(void)
             }
             printf("            %-16s pid %-7d -> %s\n", comm, cpu_top[i].pid,
                    cpu_top[i].ws >= 0 && cpu_top[i].ws < ws_count
-                       ? ws_list[cpu_top[i].ws].name : "no workspace (not under a window)");
+                       ? ws_list[cpu_top[i].ws].name : "no workspace");
+
+            /* Where the trail leads, and where it stops. If a build shows no
+             * workspace, this says which process broke the chain — a
+             * multiplexer, a container or a service does not descend from any
+             * window, so nothing can attribute it. */
+            printf("                             ");
+            int pid = cpu_top[i].pid;
+            for (int hop = 0; hop < 8 && pid > 1; ++hop) {
+                char c2[64] = "?";
+                snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+                FILE *g = fopen(path, "r");
+                if (g) {
+                    if (fgets(c2, sizeof(c2), g)) {
+                        char *nl = strchr(c2, '\n');
+                        if (nl) *nl = 0;
+                    }
+                    fclose(g);
+                }
+                bool is_win = false;
+                for (int w = 0; w < cpu_nwin; ++w)
+                    if (cpu_win[w].pid == pid) { is_win = true; break; }
+                printf("%s%d:%s", hop ? " < " : "", pid, c2);
+                if (is_win) { printf(" [window]"); break; }
+
+                int ppid; unsigned long long o, c3;
+                if (!proc_stat_of(pid, &ppid, &o, &c3)) { printf(" (gone)"); break; }
+                pid = ppid;
+            }
+            printf("\n");
         }
         if (!cpu_ws_n) printf("            no sample yet\n");
         for (int i = 0; i < cpu_ws_n; ++i)

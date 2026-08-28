@@ -15,7 +15,7 @@ what is going on.
 sudo apt install build-essential libwayland-dev
 make
 make install          # ~/.local/bin, or PREFIX=/usr/local
-make config           # optional: swbr_config.example -> ~/.config/swbr/config
+make config           # optional: config.example -> ~/.config/swbr/config
 ```
 
 `libwayland-client` is the only library it links. The wlr-layer-shell protocol
@@ -76,7 +76,7 @@ something.
 | `bar` | a gauge, `slim_min`–`slim_max` |
 | `clock` | twelve bars, lit up to the hour — two at 02:00, still two at 02:55, softer before noon |
 | `presence` | a block in the `running` colour, there only while the program is |
-| `media` | two full-height bars while playing, the same two short and dim when paused, nothing when stopped |
+| `media` | a full block while playing, a short dim one when paused, nothing when stopped |
 | `auto` | pick from what the cell prints |
 | `off` | nothing |
 
@@ -180,6 +180,27 @@ so the button's own colour still reads through the gaps — six of them on a
 30 px bar, three in the folded strip, where the same dots run up the workspace
 slot.
 
+The scale is in **cores**: `1.0` is one core kept busy, and `ws_cpu_full=4`
+means four cores fill the column. A share of the whole machine was the wrong
+unit — on sixteen threads a browser pinning two cores is twelve percent, which
+rounded to nothing, and nobody thinks about their machine that way.
+
+Anything alive but below the scale gets a single faint dot rather than
+nothing, so a workspace that is *doing* something never looks asleep — a
+player, a polling script, a shell running something small. A terminal sitting
+at a prompt still gets nothing, which is the distinction that matters.
+
+```
+0.000 cores  ......   a terminal at a prompt
+0.02         +.....   cmus playing
+0.09         +.....   a script polling every second
+0.4          #.....   mpv decoding
+1.9          ###...   a browser working
+4.0          ######   make -j4
+```
+
+`ws_cpu_idle` is where "nothing" ends and that faint dot begins.
+
 They keep one colour — `accent`, held back towards `dim` — and only tip
 towards `urgent` when a workspace is really pinned, so it is the count and not
 the hue that carries the load. `hl` is what paints the focused workspace, so
@@ -197,7 +218,7 @@ no workspace and is left out. The colour runs from `running` through
 `slim_warm` into `urgent`.
 
 ```
-ws_cpu=1  ws_cpu_interval=3  ws_cpu_min=4  ws_cpu_full=60
+ws_cpu=1  ws_cpu_interval=3  ws_cpu_idle=0.01  ws_cpu_min=0.25  ws_cpu_full=4
 ```
 
 The numbers are written to `$XDG_RUNTIME_DIR/swbr-cpu` so swov can show the
@@ -229,7 +250,7 @@ swbr --dump-config > ~/.config/swbr/config
 swbr --probe        # outputs, sizes, font metrics and what each cell prints
 ```
 
-`swbr_config.example` lists everything with defaults. The ones worth knowing:
+`config.example` lists everything with defaults. The ones worth knowing:
 
 | key | |
 | --- | --- |

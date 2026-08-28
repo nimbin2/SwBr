@@ -149,8 +149,8 @@ cmusui.align=center
 cmusui.pad=4
 cmusui.bg=ffffff14
 cmusui.color=e8b81a
-cmusui.slim=media  # folded: TWO full bars while playing, the same two short
-                   # and dim when paused, nothing when cmus is stopped.
+cmusui.slim=media  # folded: a full block while playing, a short dim one when
+                   # paused, nothing at all when cmus is stopped.
                    # source=cmus knows which, so slim_on is not needed.
 cmusui.slim_w=26   # wider than the other ticks, so it is easy to find and hit
 cmusui.button1=pgrep -x cmus >/dev/null && cmus_control toggle || foot -e cmus
@@ -291,8 +291,15 @@ ws_cpu=1           # a dot on each workspace button showing how much
                    # processor time the windows on it are using. Folded, the
                    # workspace slot fills from the bottom instead
 ws_cpu_interval=3  # seconds between samples
-ws_cpu_min=4       # below this much load nothing is drawn
-ws_cpu_full=60     # this much load paints it fully hot
+ws_cpu_idle=0.01   # in cores. Under this a workspace counts as doing
+                   # nothing and stays blank. Above it, but under ws_cpu_min,
+                   # one faint dot: a player, a polling script, something
+                   # small but alive
+ws_cpu_min=0.25    # where the real scale starts, in cores: 1.0 is one core
+                   # kept busy
+ws_cpu_full=4      # four cores fills the column. A share of the whole
+                   # machine was the wrong unit: on sixteen threads two busy
+                   # cores are twelve percent, which rounds to nothing
 
 running=3ddc84ff   # folded strip: this program is up, and where a charging
                    # gauge's pips ramp to

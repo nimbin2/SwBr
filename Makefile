@@ -31,7 +31,7 @@ install: swbr
 
 config:
 	install -d $(CONFDIR)
-	[ -f $(CONFDIR)/config ] || install -m644 swbr_config.example $(CONFDIR)/config
+	[ -f $(CONFDIR)/config ] || install -m644 config.example $(CONFDIR)/config
 
 uninstall:
 	rm -f $(BINDIR)/swbr

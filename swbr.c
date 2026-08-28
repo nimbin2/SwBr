@@ -791,7 +791,7 @@ typedef struct { int pid; int ws; } PidWs;      /* window pid -> ws_list index *
 
 static PidWs  cpu_win[512];
 static int    cpu_nwin;
-static double cpu_ws_pct[MAX_WORKSPACES];       /* by ws_list index */
+static double cpu_ws_cores[MAX_WORKSPACES];    /* by ws_list index */
 static char   cpu_ws_name[MAX_WORKSPACES][128];
 static int    cpu_ws_n;
 static double cpu_last_at;
@@ -927,7 +927,7 @@ static void cpu_write_cache(void)
     FILE *f = fopen(tmp, "w");
     if (!f) return;
     for (int i = 0; i < cpu_ws_n; ++i)
-        fprintf(f, "%s\t%.1f\n", cpu_ws_name[i], cpu_ws_pct[i]);
+        fprintf(f, "%s\t%.2f\n", cpu_ws_name[i], cpu_ws_cores[i]);
     fclose(f);
     if (rename(tmp, path) != 0) unlink(tmp);
 }
@@ -1030,10 +1030,14 @@ static void cpu_sample(void)
         cpu_ws_n = 0;
         for (int i = 0; i < ws_count && i < MAX_WORKSPACES; ++i) {
             if (used[i] < 0) used[i] = 0;
-            double pct = used[i] / dt / (double)ncpu * 100.0;
-            if (pct < 0) pct = 0;
-            if (pct > 100) pct = 100;
-            cpu_ws_pct[i] = pct;
+            /* core-seconds per second: 1.0 is one core kept busy. A share of
+             * the whole machine was the wrong unit — on sixteen threads a
+             * compiler pinning two cores is twelve percent, which rounds to
+             * nothing, and nobody thinks about their machine that way. */
+            double cores = used[i] / dt;
+            if (cores < 0) cores = 0;
+            if (cores > (double)ncpu) cores = (double)ncpu;
+            cpu_ws_cores[i] = cores;
             str_set(cpu_ws_name[cpu_ws_n], sizeof(cpu_ws_name[0]), ws_list[i].name);
             cpu_ws_n++;
         }
@@ -1143,8 +1147,8 @@ typedef struct {
     int ws_other;                /* show other monitors' workspaces too  */
     int ws_cpu;                  /* the load dot on a workspace button   */
     int ws_cpu_interval;         /* seconds between samples              */
-    float ws_cpu_min, ws_cpu_full;  /* below min nothing shows; full = the
-                                       load that paints it urgent        */
+    float ws_cpu_idle;           /* under this, nothing is happening at all */
+    float ws_cpu_min, ws_cpu_full;  /* the scale, in cores                  */
     Col ws_bg, ws_fg, ws_focused_bg, ws_focused_fg;
     Col ws_visible_bg, ws_visible_fg, ws_urgent_bg, ws_urgent_fg;
     Col mode_bg, mode_fg;
@@ -1218,8 +1222,9 @@ static void config_defaults(Config *c)
     c->ws_other        = 0;
     c->ws_cpu          = 1;
     c->ws_cpu_interval = 3;
-    c->ws_cpu_min      = 4.0f;
-    c->ws_cpu_full     = 60.0f;
+    c->ws_cpu_idle     = 0.01f;   /* one percent of one core */
+    c->ws_cpu_min      = 0.25f;   /* a quarter of one core */
+    c->ws_cpu_full     = 4.0f;    /* four cores fills the column */
     c->ws_focused_bg = (Col){ 0xcb, 0x9b, 0x00, 0xff };
     c->ws_focused_fg = (Col){ 0x14, 0x14, 0x14, 0xff };
     c->ws_visible_bg = (Col){ 0x3c, 0x4a, 0x5c, 0xff };
@@ -1445,6 +1450,7 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "ws_other")) c->ws_other = atoi(v);
     else if (!strcmp(k, "ws_cpu")) c->ws_cpu = atoi(v);
     else if (!strcmp(k, "ws_cpu_interval")) c->ws_cpu_interval = atoi(v);
+    else if (!strcmp(k, "ws_cpu_idle")) c->ws_cpu_idle = (float)atof(v);
     else if (!strcmp(k, "ws_cpu_min")) c->ws_cpu_min = (float)atof(v);
     else if (!strcmp(k, "ws_cpu_full")) c->ws_cpu_full = (float)atof(v);
     else if (!strcmp(k, "ws_focused_bg")) parse_color(v, &c->ws_focused_bg);
@@ -3144,18 +3150,18 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
          * the cell's own colour. Not playing: one short stub at a third of
          * the height, well under half as bright. Same shape at two sizes read
          * as the same thing, so the two states differ in height as well. */
+        /* One block, the full width of the slot. Two of them were meant to
+         * echo a pause glyph, from when playing and paused were told apart by
+         * shape; now that paused is short and dim and stopped is nothing at
+         * all, the height says it, and one wide block is far easier to see
+         * than two thin ones. */
         int st = media_state(e);
-        if (st > 0) {                             /* playing: two full bars */
-            float bar = w * 0.38f, gapw = w - 2.0f * bar;
-            fill_rect(cv, x, y, bar, h, c);
-            fill_rect(cv, x + bar + gapw, y, bar, h, c);
-        } else if (st == 0) {                     /* paused: the same two,
-                                                     short and dim */
+        if (st > 0) {                             /* playing */
+            fill_rect(cv, x, y, w, h, c);
+        } else if (st == 0) {                     /* paused: short and dim */
             Col d = c;
             d.a = 110;
-            float bar = w * 0.38f, gapw = w - 2.0f * bar;
-            fill_rect(cv, x, y + h * 0.34f, bar, h * 0.32f, d);
-            fill_rect(cv, x + bar + gapw, y + h * 0.34f, bar, h * 0.32f, d);
+            fill_rect(cv, x, y + h * 0.34f, w, h * 0.32f, d);
         }
         return;                                   /* st < 0: nothing to show */
     }
@@ -3190,14 +3196,35 @@ static void dot_column(Canvas *cv, float x, float y, float w, float h,
 
 /* How busy, as a colour: quiet green through the accent into urgent. Nothing
  * at all below ws_cpu_min, so an idle bar stays clean. */
-static bool cpu_load_col(int ws_idx, Col *out, float *frac)
+/* How busy, and whether it is only busy on one core.
+ *
+ * The scale is a share of the whole machine, so on sixteen threads a single
+ * pinned core is six percent — real work that looks like idling. When that is
+ * what is happening the bottom dot lights on its own, dimmer than a proper
+ * load, which says "something is running here" without pretending the
+ * workspace is hot. */
+static bool cpu_load_col(int ws_idx, Col *out, float *frac, bool *faint)
 {
+    if (faint) *faint = false;
     if (!cfg.ws_cpu || ws_idx < 0 || ws_idx >= cpu_ws_n) return false;
-    double pct = cpu_ws_pct[ws_idx];
-    if (pct < cfg.ws_cpu_min) return false;
+
+    double cores = cpu_ws_cores[ws_idx];
+    if (cores < cfg.ws_cpu_idle) return false;    /* genuinely nothing */
+
+    /* Something is happening, but not enough to be worth a place on the
+     * scale: a player decoding, a script waking up every second, a shell
+     * running something small. The bottom dot on its own, faint — a terminal
+     * sitting at a prompt gets nothing, this gets a hint. */
+    if (cores < cfg.ws_cpu_min) {
+        if (faint) *faint = true;
+        *frac = 0.0f;
+        *out = col_mix(cfg.dim, cfg.accent, 0.40f);
+        out->a = 120;
+        return true;
+    }
 
     float f = cfg.ws_cpu_full > cfg.ws_cpu_min
-            ? (float)(pct - cfg.ws_cpu_min) / (cfg.ws_cpu_full - cfg.ws_cpu_min)
+            ? (float)(cores - cfg.ws_cpu_min) / (cfg.ws_cpu_full - cfg.ws_cpu_min)
             : 1.0f;
     f = clampf(f, 0.0f, 1.0f);
     *frac = f;
@@ -3257,11 +3284,12 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
         fill_rect(cv, x, y, tick, h, c);
         if (w) {
             int wi = (int)(w - ws_list);
-            Col lc; float lf;
-            if (cpu_load_col(wi, &lc, &lf)) {
+            Col lc; float lf; bool faint;
+            if (cpu_load_col(wi, &lc, &lf, &faint)) {
                 /* Three or four dots up the slot. Filling it solid hid which
                  * workspace it was, which is the thing the slot is for. */
-                dot_column(cv, x, y, tick, h, 1.0f * s, 1.0f * s, lf, lc);
+                dot_column(cv, x, y, tick, h, 1.0f * s, 1.0f * s,
+                           faint ? 0.001f : lf, lc);
             }
         }
         if (w && b->hits < MAX_WORKSPACES) {      /* still switchable when folded */
@@ -3413,14 +3441,15 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
                       col_scale_alpha(fg, bfade * 0.72f), w->label);
         }
 
-        Col lc; float lf;
-        if (cpu_load_col(i, &lc, &lf)) {
+        Col lc; float lf; bool faint;
+        if (cpu_load_col(i, &lc, &lf, &faint)) {
             /* Up the right edge of the button, the same dots as the folded
              * strip so the two read as one idea. */
             float dw  = clampf(2.0f * s, 1.0f, 3.0f);
             float pad = 3.0f * s;
             dot_column(cv, x + bwid - dw - pad, by + pad, dw, bh - 2.0f * pad,
-                       2.0f * s, 2.0f * s, lf, col_scale_alpha(lc, bfade));
+                       2.0f * s, 2.0f * s, faint ? 0.001f : lf,
+                       col_scale_alpha(lc, bfade));
         }
 
         if (b->hits < MAX_WORKSPACES) {
@@ -4556,8 +4585,9 @@ static void probe_report(void)
                (double)baseline_for(f, 0, (float)b->bh, (float)b->scale), b->bh);
     }
     if (cfg.ws_cpu) {
-        printf("cpu per workspace, sampled every %ds (min %g%%, full %g%%)\n",
-               cfg.ws_cpu_interval, (double)cfg.ws_cpu_min, (double)cfg.ws_cpu_full);
+        printf("cpu per workspace, sampled every %ds (idle under %g, scale %g..%g cores)\n",
+               cfg.ws_cpu_interval, (double)cfg.ws_cpu_idle,
+               (double)cfg.ws_cpu_min, (double)cfg.ws_cpu_full);
         printf("            %d window(s) in sway's tree to attribute work to\n",
                cpu_nwin);
         for (int i = 0; i < cpu_nwin && i < 8; ++i)
@@ -4612,7 +4642,7 @@ static void probe_report(void)
         }
         if (!cpu_ws_n) printf("            no sample yet\n");
         for (int i = 0; i < cpu_ws_n; ++i)
-            printf("            %-12s %5.1f%%\n", cpu_ws_name[i], cpu_ws_pct[i]);
+            printf("            %-12s %5.2f cores\n", cpu_ws_name[i], cpu_ws_cores[i]);
     }
     static const char *SLIM_NAME[] = { "auto", "tick", "bar", "clock",
                                        "presence", "media", "off" };

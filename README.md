@@ -171,6 +171,20 @@ they ever get is a soft accent. They stay
 readable and clickable, and nothing about them looks like it belongs to this
 screen.
 
+## Hover
+
+`NAME.hover=` is what a cell shows while the pointer is on it — the same
+placeholders its source understands, or `%s` for a plain command's output:
+
+```
+battery.hover=%c%i  %w  %h     # 83-  21.5W  1.7h
+battery.hover_slim=1
+```
+
+The cell is measured with that text, so it grows to fit instead of
+truncating. Folded there is nowhere to put it, so `hover_slim=1` opens the bar
+for as long as you rest on that cell and folds it back when you leave.
+
 ## Load per workspace
 
 A column of dots up the right edge of each workspace button says how much

@@ -1070,6 +1070,9 @@ typedef struct {
     int   source;                /* SRC_CMD, or a player swbr knows itself   */
     char  src_fmt[128];          /* how a known player is laid out           */
     char  src_path[256];         /* where to read it from, when that varies  */
+    char  hover_fmt[192];        /* what to show while the pointer is on it  */
+    char  out_hover[512];        /* that, already filled in                  */
+    int   hover_slim;            /* folded, hovering it opens the bar        */
     int   state;                 /* what that player is doing: PS_*          */
     int   gap;                   /* -1 = cell_gap */
     int   pad;                   /* inner padding, left and right */
@@ -1294,6 +1297,8 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
         str_set(e->src_fmt, sizeof(e->src_fmt), v);
     else if (!strcmp(k, "src_path") || !strcmp(k, "bat_path"))
         str_set(e->src_path, sizeof(e->src_path), v);
+    else if (!strcmp(k, "hover")) str_set(e->hover_fmt, sizeof(e->hover_fmt), v);
+    else if (!strcmp(k, "hover_slim")) e->hover_slim = atoi(v);
     else if (!strcmp(k, "source")) {
         if (!strcasecmp(v, "cmus")) {
             e->source = SRC_CMUS;
@@ -2429,6 +2434,31 @@ static void cell_spawn(Cell *e)
     e->len = 0;
 }
 
+/* %x substitution, shared by the sources. `keys` is a string of the letters,
+ * `vals` the matching texts. */
+static void expand_fmt(char *out, size_t cap, const char *fmt,
+                       const char *keys, const char *const *vals)
+{
+    size_t o = 0;
+    for (const char *p = fmt; *p && o < cap - 1; ++p) {
+        const char *ins = NULL;
+        if (*p == '%' && p[1]) {
+            if (p[1] == '%') ins = "%";
+            else {
+                const char *at = strchr(keys, p[1]);
+                if (at) ins = vals[at - keys];
+            }
+        }
+        if (!ins) { out[o++] = *p; continue; }
+        ++p;
+        size_t l = strlen(ins);
+        if (o + l >= cap) l = cap - 1 - o;
+        memcpy(out + o, ins, l);
+        o += l;
+    }
+    out[o] = 0;
+}
+
 /* `cmus-remote -Q` prints one key per line:
  *     status playing
  *     file /music/x.flac
@@ -2481,29 +2511,12 @@ static void cmus_parse(Cell *e)
 
     /* %i icon  %n artist — title  %a artist  %t title  %s playing|paused
      * so one cell can be just the icon and another just the name */
-    const char *f = *e->src_fmt ? e->src_fmt : "%i %n";
-    size_t o = 0;
-    for (const char *p = f; *p && o < sizeof(e->out) - 1; ++p) {
-        const char *ins = NULL;
-        if (*p == '%' && p[1]) {
-            switch (p[1]) {
-            case 'i': ins = icon;   break;
-            case 'n': ins = name;   break;
-            case 'a': ins = artist; break;
-            case 't': ins = title;  break;
-            case 's': ins = e->state == PS_PLAYING ? "playing" : "paused"; break;
-            case '%': ins = "%";    break;
-            default:  break;
-            }
-        }
-        if (!ins) { e->out[o++] = *p; continue; }
-        ++p;
-        size_t l = strlen(ins);
-        if (o + l >= sizeof(e->out)) l = sizeof(e->out) - 1 - o;
-        memcpy(e->out + o, ins, l);
-        o += l;
-    }
-    e->out[o] = 0;
+    const char *vals[] = { icon, name, artist, title,
+                           e->state == PS_PLAYING ? "playing" : "paused" };
+    expand_fmt(e->out, sizeof(e->out), *e->src_fmt ? e->src_fmt : "%i %n",
+               "inats", vals);
+    if (*e->hover_fmt)
+        expand_fmt(e->out_hover, sizeof(e->out_hover), e->hover_fmt, "inats", vals);
     char *t = trim(e->out);
     if (t != e->out) memmove(e->out, t, strlen(t) + 1);
 }
@@ -2591,29 +2604,11 @@ static void battery_read(Cell *e)
     /* %c capacity, %i the sign, %w watts, %h hours left, %s the word.
      * Full gets no sign at all: nothing is happening, so nothing is said. */
     const char *sign = full ? "" : up ? "+" : "-";
-    const char *bf = *e->src_fmt ? e->src_fmt : "%c%i";
-    size_t o = 0;
-    for (const char *p = bf; *p && o < sizeof(e->out) - 1; ++p) {
-        const char *ins = NULL;
-        if (*p == '%' && p[1]) {
-            switch (p[1]) {
-            case 'c': ins = c;     break;
-            case 'i': ins = sign;  break;
-            case 'w': ins = watts; break;
-            case 'h': ins = hours; break;
-            case 's': ins = st;    break;
-            case '%': ins = "%";   break;
-            default:  break;
-            }
-        }
-        if (!ins) { e->out[o++] = *p; continue; }
-        ++p;
-        size_t l = strlen(ins);
-        if (o + l >= sizeof(e->out)) l = sizeof(e->out) - 1 - o;
-        memcpy(e->out + o, ins, l);
-        o += l;
-    }
-    e->out[o] = 0;
+    const char *vals[] = { c, sign, watts, hours, st };
+    expand_fmt(e->out, sizeof(e->out), *e->src_fmt ? e->src_fmt : "%c%i",
+               "ciwhs", vals);
+    if (*e->hover_fmt)
+        expand_fmt(e->out_hover, sizeof(e->out_hover), e->hover_fmt, "ciwhs", vals);
 }
 
 static void cell_finish(Cell *e)
@@ -2626,6 +2621,10 @@ static void cell_finish(Cell *e)
     char *t = trim(e->buf);
     for (char *q = t; *q; ++q) if (*q == '\n' || *q == '\r' || *q == '\t') *q = ' ';
     str_set(e->out, sizeof(e->out), t);
+    if (*e->hover_fmt) {
+        const char *vals[] = { e->out };
+        expand_fmt(e->out_hover, sizeof(e->out_hover), e->hover_fmt, "s", vals);
+    }
     e->len = 0;
 }
 
@@ -2754,9 +2753,19 @@ static bool cell_visible(Cell *e)
 }
 
 /* what a cell draws right now, and in which colour */
+static int HOVER_CELL = -1;      /* set per bar before it is measured */
+
 static void cell_display(Cell *e, char *out, size_t cap, Col *col)
 {
     if (cell_is_msg(e)) { str_set(out, cap, msg_text); *col = msg_color(); return; }
+
+    /* The pointer is on it and it has something longer to say. The cell is
+     * measured with this text too, so it grows to fit rather than truncating. */
+    if (HOVER_CELL >= 0 && e == &cfg.cell[HOVER_CELL] && e->out_hover[0]) {
+        str_set(out, cap, e->out_hover);
+        *col = cell_color(e);
+        return;
+    }
     if (!*e->out && *e->empty) { str_set(out, cap, e->empty); *col = cell_color(e); return; }
     cell_text(e, out, cap);
     *col = cell_color(e);
@@ -2808,6 +2817,7 @@ struct Bar {
     /* workspace hit boxes, rebuilt on every render */
     struct { float x0, x1; char name[128]; } hit[MAX_WORKSPACES];
     int hits;
+    bool hover_open;            /* opened by a hover, folds back on leave */
     struct { float x0, x1; int cell; } chit[MAX_CELLS];
     int chits;
 };
@@ -3186,7 +3196,7 @@ static void dot_column(Canvas *cv, float x, float y, float w, float h,
     if (lit > n) lit = n;
 
     Col dim_c = c;
-    dim_c.a = (uint8_t)(c.a * 0.28f);
+    dim_c.a = (uint8_t)(c.a * 0.38f);
 
     for (int i = 0; i < n; ++i) {
         float dy = y + h - (float)(i + 1) * dot - (float)i * gap;
@@ -3288,7 +3298,7 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
             if (cpu_load_col(wi, &lc, &lf, &faint)) {
                 /* Three or four dots up the slot. Filling it solid hid which
                  * workspace it was, which is the thing the slot is for. */
-                dot_column(cv, x, y, tick, h, 1.0f * s, 1.0f * s,
+                dot_column(cv, x, y, tick, h, 2.0f * s, 1.0f * s,
                            faint ? 0.001f : lf, lc);
             }
         }
@@ -3823,6 +3833,18 @@ static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
     markup_parse(status_line, &rs, cfg.text);
 
     float fade = clampf(b->vis * 1.6f - 0.25f, 0.0f, 1.0f);
+
+    /* which cell the pointer is on, from the frame before — a pointer-move
+       behind at worst, and the cell has to be measured with its hover text
+       so it grows to fit instead of truncating */
+    HOVER_CELL = -1;
+    if (b->hovered)
+        for (int i = 0; i < b->chits; ++i)
+            if (b->px >= b->chit[i].x0 && b->px < b->chit[i].x1) {
+                HOVER_CELL = b->chit[i].cell;
+                break;
+            }
+
     b->hits = 0;
     b->chits = 0;
     if (fade <= 0.01f) {
@@ -4092,8 +4114,29 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial, struct wl_
     if (!b) return;
     b->hovered = false;
     b->dirty = true;
+    if (b->hover_open) { b->hover_open = false; bar_set_collapsed(b, true); }
     bar_set_grab(b, false);
     if (pointer_bar == b) pointer_bar = NULL;
+}
+
+/* Folded, a cell is a few pixels wide and has nowhere to put a longer text.
+ * With hover_slim set, resting on it opens the bar for as long as you stay,
+ * and it folds itself back when you leave. */
+static void hover_slim_check(Bar *b)
+{
+    int on = -1;
+    if (b->hovered)
+        for (int i = 0; i < b->chits; ++i)
+            if (b->px >= b->chit[i].x0 && b->px < b->chit[i].x1 &&
+                cfg.cell[b->chit[i].cell].hover_slim) { on = b->chit[i].cell; break; }
+
+    if (on >= 0 && b->collapsed && !b->hover_open) {
+        b->hover_open = true;
+        bar_set_collapsed(b, false);
+    } else if (on < 0 && b->hover_open) {
+        b->hover_open = false;
+        bar_set_collapsed(b, true);
+    }
 }
 
 static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t sx, wl_fixed_t sy)
@@ -4103,6 +4146,7 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t sx,
     pointer_bar->px = wl_fixed_to_double(sx);
     pointer_bar->py = wl_fixed_to_double(sy);
     pointer_bar->dirty = true;
+    hover_slim_check(pointer_bar);
 }
 
 static void ws_switch(const char *name)
@@ -4422,6 +4466,12 @@ static void usage(void)
 "  NAME.cmus_fmt=%i %n how it is laid out: %i icon, %n artist — title, %a,\n"
 "                      %t, %s playing|paused. One cell can be just the icon\n"
 "                      and another just the name\n"
+"  NAME.hover=         what to show while the pointer is on this cell. Same\n"
+"                      placeholders as src_fmt, or %s for a command cell's\n"
+"                      output. The cell is measured with it, so it grows to\n"
+"                      fit rather than truncating\n"
+"  NAME.hover_slim=0   1 = folded, resting on this cell opens the bar for as\n"
+"                      long as you stay on it\n"
 "  NAME.slim_color2=   second colour: the minutes of a clock cell, and its\n"
 "                      hour bars before noon. clock lights every bar up to\n"
 "                      the hour, so 02:00 and 02:55 both show two\n"

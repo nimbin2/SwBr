@@ -233,6 +233,8 @@ battery.source=battery  # reads /sys itself: 83+ filling, 83- draining, no
                    # left, %s the word. This one reads "83- 21.5W 1.7h"
 # battery.cmd=...   # setting a command switches the cell back to your own
                    # script; source= and cmd= are the two ways, never both
+battery.hover=%c%i  %w  %h   # while the pointer is on it: 83-  21.5W  1.7h
+battery.hover_slim=1    # folded, resting on it opens the bar so that fits
 battery.interval=10
 battery.color=e1eeff
 battery.warn=<30:cecb00

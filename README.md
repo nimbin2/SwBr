@@ -109,7 +109,9 @@ already knows.
 
 `slim_align=1` (the default) gives each mark its cell's whole place — same left
 edge, same width — so folding changes the height of the bar and nothing else.
-`slim_align=0` packs them against the right edge instead.
+Starting folded, the open layout is worked out once with nothing drawn, so the
+marks are the right size from the first frame. `slim_align=0` packs them
+against the right edge instead.
 
 `signals=0` leaves a plain strip.
 
@@ -119,12 +121,34 @@ edge, same width — so folding changes the height of the bar and nothing else.
 placeholders its source understands, or `%s` for a command's output:
 
 ```
-battery.hover=%c%i  %w  %h     # 83-  21.5W  1.7h
-battery.hover_slim=1
+battery.hover=%w  %h           # 21.5W  1.7h — the cell already says 83-
+battery.hover_slim=0
 ```
 
-The cell is measured with that text, so it grows to fit. Folded there is
-nowhere to put it, so `hover_slim=1` opens the bar while you rest on that cell.
+It slides down out of the bar and fades in over `anim_ms`, centred on the
+cell: square where the two meet, rounded on the far side, and always clear of
+the bar's own rounded corners at either end. The surface grows to make room and
+shrinks again when you leave. The padding either side of a cell counts as
+part of it, and the panel itself takes the pointer, so resting on it keeps it
+open.
+
+`NAME.hover_cal=1` puts this month in the panel, with today in the `hl`
+colour. It is built in rather than shelled out to `cal(1)`, so the columns line
+up whatever the font and resting on the clock spawns nothing. Weeks start on
+Monday.
+
+`NAME.hover_cmd=` is the general form: any command's output, run once when the
+hover starts rather than on a timer. The panel is as tall as the output has
+lines either way.
+
+```
+clock.hover_cal=1
+clock.hover_cmd=cal      # the same idea, if you prefer cal's own layout
+```
+
+Folded there is no room for a panel, so there is no hover unless
+`hover_slim=1`, which opens the bar while you rest on that cell. Off by
+default.
 
 ## Load per workspace
 

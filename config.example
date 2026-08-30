@@ -188,6 +188,11 @@ mpv.slim_color=3ea6ff  # its own colour, so you can tell the two apart
 cell=clock
 clock.cmd=date '+<span foreground="#00ffff">%H:%M</span>  %a %d.%m'
 clock.interval=5
+clock.hover_cal=1  # the panel: this month, with today in the hl colour.
+                   # Built in, so the columns line up whatever the font and
+                   # nothing is spawned. hover_cmd=cal would work too
+# clock.hover_cmd=cal  # the panel: this month, from cal(1). Run once when
+                   # the hover starts, not on a timer
 clock.slim=clock   # twelve dots for the hour, in the same cyan the clock
                    # uses in the full bar (taken from its own markup)
 clock.slim_color2=2f7f9f   # the minutes bar, and the morning hours. Every dot
@@ -216,13 +221,16 @@ temp.slim=bar      # a gauge too, but degrees are not percent:
 temp.slim_min=40   # so map 40..100 C onto the gauge
 temp.slim_max=100
 
-# --- battery: draw and remaining time, then capacity, joined ---------------
-cell=power
-power.cmd=b=/sys/class/power_supply/BAT0; grep -q Discharging $b/status || exit 0; awk -v e="$(cat $b/energy_now)" -v p="$(cat $b/power_now)" 'BEGIN{if(p>0)printf "%.2fW %.1fh", p/1000000, e/p}'
-power.interval=10
-power.color=b3c0cd
-power.slim=off     # watts and hours say nothing as a bar
-power.sep=0
+# --- battery ---------------------------------------------------------------
+# The draw and the time left live in the hover panel now, so they are there
+# when you want them and not taking width when you do not. Uncomment this if
+# you would rather have them in the bar all the time.
+# cell=power
+# power.source=battery
+# power.src_fmt=%w %h
+# power.color=b3c0cd
+# power.slim=off
+# power.sep=0
 
 # The marker at the end tells the folded strip which way it is going:
 # + charging, - discharging, = full. In the full bar it reads as ⚡ or nothing.
@@ -236,8 +244,10 @@ battery.source=battery  # reads /sys itself: 83+ filling, 83- draining, no
                    # left, %s the word. This one reads "83- 21.5W 1.7h"
 # battery.cmd=...   # setting a command switches the cell back to your own
                    # script; source= and cmd= are the two ways, never both
-battery.hover=%c%i  %w  %h   # while the pointer is on it: 83-  21.5W  1.7h
-battery.hover_slim=1    # folded, resting on it opens the bar so that fits
+battery.hover=%w   %h   # the panel: just what the cell does not already
+                        # say — 21.5W  1.7h
+battery.hover_slim=0    # 1 = folded, resting on it opens the bar so the
+                        # panel has somewhere to go. 0 = no hover when folded
 battery.interval=10
 battery.color=e1eeff
 battery.warn=<30:cecb00
@@ -284,7 +294,7 @@ button7=cmus_control next
 #   (..) glues items together with no separator between them.
 #   names are cell names plus the built-ins "workspaces" and "mode".
 # ---------------------------------------------------------------------------
-bar={workspaces,mode||(cmus,cmusui),volume,(docker,mpv),clock,(cpu,temp),(power,battery)}
+bar={workspaces,mode||(cmus,cmusui),volume,(docker,mpv),clock,(cpu,temp),battery}
 
 # --- colors: #rrggbb or #rrggbbaa ------------------------------------------
 bg=26313fe6         # the bar itself

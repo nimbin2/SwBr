@@ -1071,6 +1071,8 @@ typedef struct {
     char  src_fmt[128];          /* how a known player is laid out           */
     char  src_path[256];         /* where to read it from, when that varies  */
     char  hover_fmt[192];        /* what to show while the pointer is on it  */
+    char  hover_cmd[256];        /* ...or the output of this, run on hover   */
+    int   hover_cal;             /* ...or a month, with today marked         */
     char  out_hover[512];        /* that, already filled in                  */
     int   hover_slim;            /* folded, hovering it opens the bar        */
     int   state;                 /* what that player is doing: PS_*          */
@@ -1302,6 +1304,8 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
              !strcmp(k, "program"))
         str_set(e->src_path, sizeof(e->src_path), v);
     else if (!strcmp(k, "hover")) str_set(e->hover_fmt, sizeof(e->hover_fmt), v);
+    else if (!strcmp(k, "hover_cmd")) str_set(e->hover_cmd, sizeof(e->hover_cmd), v);
+    else if (!strcmp(k, "hover_cal")) e->hover_cal = atoi(v);
     else if (!strcmp(k, "hover_slim")) e->hover_slim = atoi(v);
     else if (!strcmp(k, "source")) {
         if (!strcasecmp(v, "cmus")) {
@@ -2849,19 +2853,12 @@ static bool cell_visible(Cell *e)
 }
 
 /* what a cell draws right now, and in which colour */
-static int HOVER_CELL = -1;      /* set per bar before it is measured */
 
 static void cell_display(Cell *e, char *out, size_t cap, Col *col)
 {
     if (cell_is_msg(e)) { str_set(out, cap, msg_text); *col = msg_color(); return; }
 
-    /* The pointer is on it and it has something longer to say. The cell is
-     * measured with this text too, so it grows to fit rather than truncating. */
-    if (HOVER_CELL >= 0 && e == &cfg.cell[HOVER_CELL] && e->out_hover[0]) {
-        str_set(out, cap, e->out_hover);
-        *col = cell_color(e);
-        return;
-    }
+
     if (!*e->out && *e->empty) { str_set(out, cap, e->empty); *col = cell_color(e); return; }
     cell_text(e, out, cap);
     *col = cell_color(e);
@@ -2914,6 +2911,12 @@ struct Bar {
     struct { float x0, x1; char name[128]; } hit[MAX_WORKSPACES];
     int hits;
     bool hover_open;            /* opened by a hover, folds back on leave */
+    bool measured_full;         /* the open layout has been worked out once */
+    int  tip_showing;           /* the cell whose panel is open, or -1      */
+    float tip_cx;               /* the middle of that cell, logical px      */
+    uint32_t tip_at;            /* when it opened, for the slide            */
+    int  tip_h;                 /* extra surface for the hover text, logical */
+    int  tip_cell;              /* which cell it belongs to, or -1          */
     float cellx0[MAX_CELLS], cellx1[MAX_CELLS];  /* where each cell sat in the
                                                     full bar, so the folded
                                                     strip can line up with it */
@@ -3957,6 +3960,138 @@ static int bar_natural_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
     return want;
 }
 
+/* How tall the surface has to be: the bar, plus a strip for the hover text
+ * when there is one. Growing the cell instead pushed everything beside it
+ * along and left a hole at the end of the row, which is not what a tooltip
+ * should do to a bar. */
+static int bar_wanted_h(Bar *b)
+{
+    return bar_height_logical() + b->tip_h;
+}
+
+/* one row per line, so `cal` gets its six weeks */
+static int bar_tip_height(Bar *b, const char *txt)
+{
+    (void)b;
+    int lines = 1;
+    for (const char *p = txt; *p; ++p) if (*p == '\n') lines++;
+    int row = (int)lroundf(cfg.text_px * cfg.ui_scale * 1.35f);
+    if (row < 8) row = 8;
+    return lines * row + 8;
+}
+
+static void bar_fit_height(Bar *b)
+{
+    if (!b->ls) return;
+    int want = bar_wanted_h(b);
+    if (want == b->h) return;
+    ls_set_size(b->ls, (uint32_t)(cfg.min_width > 0 ? b->want_w : 0), (uint32_t)want);
+    wl_surface_commit(b->surf);
+}
+
+/* the text a hovered cell wants to show, or NULL */
+/* A month grid, built here rather than shelled out to cal(1): that way today
+ * can be marked, the columns line up whatever the font, and resting on the
+ * clock spawns nothing. Weeks start on Monday. */
+static void hover_cal_build(Cell *e)
+{
+    time_t now = time(NULL);
+    struct tm t;
+    localtime_r(&now, &t);
+
+    struct tm first = t;
+    first.tm_mday = 1;
+    first.tm_hour = 12; first.tm_min = 0; first.tm_sec = 0;
+    time_t ft = mktime(&first);
+    localtime_r(&ft, &first);
+
+    static const int LEN[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    int year = first.tm_year + 1900, mon = first.tm_mon;
+    int days = LEN[mon];
+    if (mon == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) days = 29;
+
+    int lead = (first.tm_wday + 6) % 7;          /* Monday first */
+    static const char *MON[] = { "January","February","March","April","May",
+                                 "June","July","August","September","October",
+                                 "November","December" };
+
+    char out[1024];
+    size_t o = 0;
+    o += (size_t)snprintf(out + o, sizeof(out) - o, "%s %d\n", MON[mon], year);
+    o += (size_t)snprintf(out + o, sizeof(out) - o, "Mo Tu We Th Fr Sa Su\n");
+
+    char hl[16];
+    snprintf(hl, sizeof(hl), "%02x%02x%02x", cfg.hl.r, cfg.hl.g, cfg.hl.b);
+
+    int col = 0;
+    for (int i = 0; i < lead; ++i, ++col)
+        o += (size_t)snprintf(out + o, sizeof(out) - o, "   ");
+    for (int d = 1; d <= days && o < sizeof(out) - 64; ++d) {
+        if (d == t.tm_mday)
+            o += (size_t)snprintf(out + o, sizeof(out) - o,
+                                  "<span foreground=\"%s\">%2d</span>%s", hl, d,
+                                  col == 6 ? "" : " ");
+        else
+            o += (size_t)snprintf(out + o, sizeof(out) - o, "%2d%s", d,
+                                  col == 6 ? "" : " ");
+        if (++col == 7) { col = 0; if (d < days) o += (size_t)snprintf(out + o, sizeof(out) - o, "\n"); }
+    }
+    str_set(e->out_hover, sizeof(e->out_hover), out);
+}
+
+/* `cal`, or anything else whose output is the panel. Run once when the hover
+ * starts and kept until it ends, so resting on the clock does not spawn a
+ * process every frame. */
+static void hover_cmd_run(Cell *e)
+{
+    e->out_hover[0] = 0;
+    FILE *p = popen(e->hover_cmd, "r");
+    if (!p) return;
+    size_t n = fread(e->out_hover, 1, sizeof(e->out_hover) - 1, p);
+    pclose(p);
+    e->out_hover[n] = 0;
+    while (n && (e->out_hover[n - 1] == '\n' || e->out_hover[n - 1] == ' '))
+        e->out_hover[--n] = 0;
+}
+
+static const char *bar_tip_text(Bar *b)
+{
+    if (!b->hovered) return NULL;
+
+    /* The panel is part of the bar's surface, so the pointer can be on it
+     * rather than on the cell — keep it open while it is. */
+    if (b->tip_showing >= 0 && b->tip_h > 0) {
+        bool top = strcmp(cfg.position, "bottom") != 0;
+        double t0 = top ? bar_visible_logical(b) : 0;
+        double t1 = top ? (double)b->h : (double)b->tip_h;
+        if (b->py >= t0 && b->py < t1) {
+            b->tip_cell = b->tip_showing;
+            return cfg.cell[b->tip_cell].out_hover;
+        }
+    }
+
+    /* half the gap either side counts as the cell: the padding between two
+     * cells belongs to whichever you are nearest, not to neither */
+    float slack = (float)cfg.cell_gap * 0.5f;
+    for (int i = 0; i < b->chits; ++i) {
+        if (b->px < b->chit[i].x0 - slack || b->px >= b->chit[i].x1 + slack) continue;
+        Cell *e = &cfg.cell[b->chit[i].cell];
+        if (!e->out_hover[0] && !*e->hover_cmd && !e->hover_cal) return NULL;
+        if (b->tip_showing != b->chit[i].cell) {
+            if (e->hover_cal)        hover_cal_build(e);
+            else if (*e->hover_cmd)  hover_cmd_run(e);
+        }
+        if (!e->out_hover[0]) return NULL;
+        b->tip_cell = b->chit[i].cell;
+        /* where the cell is, taken now: the hit areas are cleared before the
+         * panel is painted, and falling back to the pointer made the panel
+         * slide about under the cursor */
+        b->tip_cx = (b->chit[i].x0 + b->chit[i].x1) * 0.5f;
+        return e->out_hover;
+    }
+    return NULL;
+}
+
 static void bar_fit_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
 {
     if (cfg.min_width <= 0 || !b->ls) return;
@@ -3970,11 +4105,116 @@ static void bar_fit_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
 
 /* Everything the bar paints, into a plain canvas. Split out of bar_render so
  * it can be exercised without a compositor. */
+/* the hover text, in the strip of surface reserved under (or over) the bar */
+static void bar_paint_tip(Bar *b, Canvas *cv, Font *f, float s, bool top,
+                          float bar_y0, float bar_vis)
+{
+    const char *txt = b->tip_cell >= 0 && b->tip_cell < cfg.cell_count
+                    ? cfg.cell[b->tip_cell].out_hover : NULL;
+    if (!txt || !*txt || b->tip_h <= 0) return;
+
+    float th = (float)b->tip_h * s;
+    float ty = top ? bar_y0 + bar_vis : bar_y0 - th;
+
+    /* The canvas is clipped to the bar's own rows by the time we get here,
+     * and the panel is by definition outside them — so it was being drawn
+     * and thrown away every frame. Open the clip to its strip, and put it
+     * back for whatever the bar draws next. */
+    canvas_clip(cv, 0, (int)floorf(ty), cv->w, (int)ceilf(ty + th));
+
+    /* one Runs per line: `cal` is a block of text, not a sentence */
+    char buf[1024];
+    str_set(buf, sizeof(buf), txt);
+
+    char *line[24];
+    int   nlines = 0;
+    for (char *p = buf; *p && nlines < (int)(sizeof line / sizeof *line); ) {
+        line[nlines++] = p;
+        char *nl = strchr(p, '\n');
+        if (!nl) break;
+        *nl = 0;
+        p = nl + 1;
+    }
+
+    Runs rs[24];
+    int saved = cfg.markup;
+    cfg.markup = cfg.cell[b->tip_cell].markup;
+    float tw = 0;
+    for (int i = 0; i < nlines; ++i) {
+        markup_parse(line[i], &rs[i], cell_color(&cfg.cell[b->tip_cell]));
+        float lw = 0;
+        for (int j = 0; j < rs[i].n; ++j) lw += text_width(f, rs[i].v[j].text);
+        if (lw > tw) tw = lw;
+    }
+    cfg.markup = saved;
+
+    float pad = 8.0f * s;
+    float pw  = tw + 2.0f * pad;
+    float rad = clampf(cfg.radius * s, 0.0f, th * 0.5f);
+
+    /* Clear of the bar's rounded corners at either end, so the panel never
+       overlaps the curve. */
+    float edge = rad + 4.0f * s;
+    float bx = clampf(b->tip_cx * s - pw * 0.5f,
+                      edge, (float)cv->w - pw - edge);
+    if (bx < 0.0f) bx = 0.0f;
+
+    /* Slide out and fade in: it should arrive rather than appear. */
+    float k = cfg.anim_ms > 0
+            ? clampf((float)(now_ms() - b->tip_at) / (float)cfg.anim_ms, 0.0f, 1.0f)
+            : 1.0f;
+    float e = k * k * (3.0f - 2.0f * k);
+    float slide = (1.0f - e) * th * 0.45f;
+    ty += top ? -slide : slide;
+
+    if (top) fill_round(cv, bx, ty, pw, th, 0, 0, rad, rad,
+                        col_scale_alpha(cfg.bg, e));
+    else     fill_round(cv, bx, ty, pw, th, rad, rad, 0, 0,
+                        col_scale_alpha(cfg.bg, e));
+
+    float row = (th - 8.0f * s) / (float)(nlines > 0 ? nlines : 1);
+    for (int i = 0; i < nlines; ++i) {
+        float ly = ty + 4.0f * s + (float)i * row;
+        float base = baseline_for(f, ly, row, s);
+        float x = bx + pad;
+        for (int j = 0; j < rs[i].n; ++j) {
+            Col tc = rs[i].v[j].has_fg ? rs[i].v[j].fg : cfg.text;
+            text_draw(cv, f, x, base, col_scale_alpha(tc, e), rs[i].v[j].text);
+            x += text_width(f, rs[i].v[j].text);
+        }
+    }
+
+    canvas_clip(cv, 0, (int)floorf(bar_y0), cv->w, (int)ceilf(bar_y0 + bar_vis));
+}
+
+/* the three groups, laid out and drawn. With the clip closed it draws
+ * nothing and only records where things would go. */
+static void bar_measure_layout(Canvas *cv, Bar *b, Font *f, float y0,
+                               float vis, float s, float bw)
+{
+    if (!cfg.cell_count && !layout_n[G_LEFT]) return;
+    float gap = (float)cfg.cell_gap * s;
+    float left_limit = (float)cfg.pad_x * s;
+    float right = bw - (float)(cfg.pad_right >= 0 ? cfg.pad_right : cfg.pad_x) * s;
+
+    float lw = group_width(cv, b, f, G_LEFT, vis, s);
+    float after_left = left_limit + (lw > 0 ? lw + gap : 0.0f);
+    float rx = draw_group(cv, b, f, G_RIGHT, y0, vis, s, 1.0f, after_left, right);
+    float mx = draw_message(cv, b, f, y0, vis, s, 1.0f, after_left, rx - gap);
+    float cx = draw_group(cv, b, f, G_CENTER, y0, vis, s, 1.0f, after_left,
+                          fminf(rx, mx) - gap);
+    draw_group(cv, b, f, G_LEFT, y0, vis, s, 1.0f, left_limit, cx - gap);
+}
+
 static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
 {
     bool top = strcmp(cfg.position, "bottom") != 0;
     float vis = visL * s;
+    float tip = (float)b->tip_h * s;
+    /* the bar stays flush with the screen edge; the tip takes the strip on
+       the inward side of it */
     float y0 = top ? 0.0f : (float)cv->h - vis;
+    (void)tip;
     float rad = cfg.radius * s;
     float bw = (float)cv->w;
 
@@ -3990,28 +4230,45 @@ static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
 
     float fade = clampf(b->vis * 1.6f - 0.25f, 0.0f, 1.0f);
 
-    /* which cell the pointer is on, from the frame before — a pointer-move
-       behind at worst, and the cell has to be measured with its hover text
-       so it grows to fit instead of truncating */
-    HOVER_CELL = -1;
-    if (b->hovered)
-        for (int i = 0; i < b->chits; ++i)
-            if (b->px >= b->chit[i].x0 && b->px < b->chit[i].x1) {
-                HOVER_CELL = b->chit[i].cell;
-                break;
-            }
+    /* Which cell is under the pointer, and what it wants to say. It has to be
+     * worked out here, before the hit areas are cleared for this frame —
+     * asking afterwards found an empty list every time, which is why the
+     * panel never appeared. */
+    b->tip_cell = -1;
+    const char *tiptxt = fade > 0.01f ? bar_tip_text(b) : NULL;
+    int want_tip = tiptxt ? bar_tip_height(b, tiptxt) : 0;
+    if (want_tip != b->tip_h) { b->tip_h = want_tip; bar_fit_height(b); }
+    if (tiptxt && b->tip_showing != b->tip_cell) b->tip_at = now_ms();
+    b->tip_showing = tiptxt ? b->tip_cell : -1;
+
+    Font *f = font_get((int)lroundf(cfg.text_px * cfg.ui_scale * s));
 
     b->hits = 0;
     b->chits = 0;
     if (fade <= 0.01f) {
+        /* Folded before the bar has ever been drawn open, the strip has no
+         * positions to line up with. Run the full layout with the canvas
+         * clipped to nothing: it draws no pixels and records where every cell
+         * and workspace would sit. */
+        if (!b->measured_full) {
+            int sx0 = cv->cx0, sy0 = cv->cy0, sx1 = cv->cx1, sy1 = cv->cy1;
+            canvas_clip(cv, 0, 0, 0, 0);
+            bar_measure_layout(cv, b, f, y0, vis, s, bw);
+            cv->cx0 = sx0; cv->cy0 = sy0; cv->cx1 = sx1; cv->cy1 = sy1;
+            b->measured_full = true;
+            b->hits = 0;
+            b->chits = 0;
+        }
         draw_signals(cv, b, y0, vis, s, &rs);
         return;
     }
+    b->measured_full = true;
 
     canvas_clip(cv, 0, (int)floorf(y0), (int)bw, (int)ceilf(y0 + vis));
 
-    Font *f = font_get((int)lroundf(cfg.text_px * cfg.ui_scale * s));
     bar_fit_width(b, cv, f, vis, s);
+    bar_paint_tip(b, cv, f, s, top, y0, vis);
+
     float gap = (float)cfg.cell_gap * s;
     float left_limit = (float)cfg.pad_x * s;
     float right = bw - (float)(cfg.pad_right >= 0 ? cfg.pad_right : cfg.pad_x) * s;
@@ -4064,13 +4321,16 @@ static void bar_render(Bar *b)
     /* only the visible strip takes clicks — the rest of the surface is
      * transparent and must not swallow them */
     struct wl_region *reg = wl_compositor_create_region(compositor);
-    int rv = (int)ceilf(visL);
+    /* the bar, plus the panel while one is open: the pointer has to be able
+     * to rest on the panel without the hover ending under it */
+    int rv = (int)ceilf(visL) + (b->tip_h > 0 ? b->tip_h : 0);
     wl_region_add(reg, 0, top ? 0 : b->h - rv, b->w, rv);
     wl_surface_set_input_region(b->surf, reg);
     wl_region_destroy(reg);
 
-    if (cfg.exclusive)
-        ls_set_exclusive_zone(b->ls, rv + cfg.margin);
+    if (cfg.exclusive)                       /* the panel must not reserve
+                                                space: it is transient */
+        ls_set_exclusive_zone(b->ls, (int)ceilf(visL) + cfg.margin);
 
     wl_surface_commit(b->surf);
     b->dirty = false;
@@ -4087,7 +4347,13 @@ static void bar_set_collapsed(Bar *b, bool c)
     b->dirty = true;
 }
 
-static bool bar_animating(Bar *b) { return b->vis != b->anim_to; }
+static bool bar_animating(Bar *b)
+{
+    if (b->vis != b->anim_to) return true;
+    if (b->tip_showing >= 0 && cfg.anim_ms > 0 &&
+        (int32_t)(now_ms() - b->tip_at) < cfg.anim_ms) return true;   /* sliding */
+    return false;
+}
 
 static void bar_anim_step(Bar *b, uint32_t t)
 {
@@ -4142,7 +4408,7 @@ static void bar_create(Output *o)
     b->out = o;
     b->scale = o->scale > 0 ? o->scale : 1;
     b->w = 0;
-    b->h = bar_height_logical();
+    b->h = bar_wanted_h(b);
     b->vis = cfg.start_collapsed ? 0.0f : 1.0f;
     b->anim_to = b->vis;
     b->collapsed = cfg.start_collapsed != 0;

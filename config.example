@@ -176,7 +176,10 @@ docker.slim=presence   # folded: a block in the running colour, there only
                        # while dockerd is, so a glance says it is up
 
 cell=mpv
-mpv.cmd=pgrep -x mpv >/dev/null || exit 0; ws=$(swaymsg -t get_workspaces | jq -r '.[] | select(.representation != null) | select(.representation | test("mpv")) | .name' | paste -sd'|'); [ -n "$ws" ] && printf '<span foreground="#19cb00">mpv </span><span foreground="#3E98E7">[%s]</span>' "$ws" || printf '<span foreground="#cecb00">mpv</span>'
+mpv.source=window  # asks sway which workspaces have an mpv window, no jq and
+                   # no swaymsg. %n the name, %w the workspaces, %c how many
+mpv.program=mpv    # matched against app_id, the X11 class, then the title
+mpv.src_fmt=<span foreground="#19cb00">%n </span><span foreground="#3E98E7">[%w]</span>
 mpv.interval=3
 mpv.slim=presence      # same for mpv: started something in the background?
 mpv.slim_color=3ea6ff  # its own colour, so you can tell the two apart
@@ -249,6 +252,10 @@ hover_keys=1       # grab the keyboard while the pointer is over the bar.
                    # That is what makes hide_key work without clicking first.
 collapsed_px=5
 anim_ms=120
+slim_align=1       # folded: each mark takes its cell's whole place, same
+                   # left edge and same width, so toggling changes the height
+                   # of the bar and nothing else.
+                   # 0 = pack them against the right edge instead
 signals=1          # the folded strip still says something: every workspace
                    # keeps a fixed slot on the left (slot 3 is always
                    # workspace 3), the clock becomes twelve dots, and cells

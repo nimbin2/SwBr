@@ -1058,7 +1058,7 @@ static void cpu_sample(void)
  * `NAME.source=cmus` is the exception: swbr runs cmus-remote itself and reads
  * the answer, so whether something is playing is a fact rather than a guess
  * at what a script happened to print. */
-enum { SRC_CMD, SRC_CMUS, SRC_BATTERY };
+enum { SRC_CMD, SRC_CMUS, SRC_BATTERY, SRC_WINDOW };
 enum { PS_UNKNOWN = -1, PS_STOPPED = 0, PS_PAUSED = 1, PS_PLAYING = 2 };
 typedef struct {
     char  name[32];
@@ -1148,6 +1148,8 @@ typedef struct {
     /* colors */
     Col bg, text, dim, accent, hl, urgent, outline, running, slim_warm;
     int ws_other;                /* show other monitors' workspaces too  */
+    int slim_align;              /* folded marks sit under their full-bar
+                                    positions, rather than packed right   */
     int ws_cpu;                  /* the load dot on a workspace button   */
     int ws_cpu_interval;         /* seconds between samples              */
     float ws_cpu_idle;           /* under this, nothing is happening at all */
@@ -1223,6 +1225,7 @@ static void config_defaults(Config *c)
     c->ws_bg         = (Col){ 0x1e, 0x27, 0x33, 0x00 };
     c->ws_fg         = (Col){ 0xb3, 0xc0, 0xcd, 0xff };
     c->ws_other        = 0;
+    c->slim_align      = 1;
     c->ws_cpu          = 1;
     c->ws_cpu_interval = 3;
     c->ws_cpu_idle     = 0.01f;   /* one percent of one core */
@@ -1295,7 +1298,8 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
     else if (!strcmp(k, "slim_on")) str_set(e->slim_on, sizeof(e->slim_on), v);
     else if (!strcmp(k, "src_fmt") || !strcmp(k, "cmus_fmt"))
         str_set(e->src_fmt, sizeof(e->src_fmt), v);
-    else if (!strcmp(k, "src_path") || !strcmp(k, "bat_path"))
+    else if (!strcmp(k, "src_path") || !strcmp(k, "bat_path") ||
+             !strcmp(k, "program"))
         str_set(e->src_path, sizeof(e->src_path), v);
     else if (!strcmp(k, "hover")) str_set(e->hover_fmt, sizeof(e->hover_fmt), v);
     else if (!strcmp(k, "hover_slim")) e->hover_slim = atoi(v);
@@ -1312,10 +1316,18 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
             if (!*e->bind[1])  str_set(e->bind[1], sizeof(e->bind[1]), "cmus-remote -u");
             if (!*e->bind[2])  str_set(e->bind[2], sizeof(e->bind[2]), "cmus-remote -n");
             if (!*e->bind[3])  str_set(e->bind[3], sizeof(e->bind[3]), "cmus-remote -r");
+        } else if (!strcasecmp(v, "window") || !strcasecmp(v, "program")) {
+            e->source = SRC_WINDOW;
+            e->cmd[0] = 0;                       /* it asks sway, not a shell */
+            if (!e->interval) e->interval = 3;
+            if (e->slim == SLIM_AUTO) e->slim = SLIM_PRESENCE;
+            if (!*e->src_path) str_set(e->src_path, sizeof(e->src_path), e->name);
         } else if (!strcasecmp(v, "battery") || !strcasecmp(v, "bat")) {
             e->source = SRC_BATTERY;
-            /* it reads /sys itself; the command only paces it */
-            str_set(e->cmd, sizeof(e->cmd), "true");
+            /* no command: spawning /bin/true every twenty seconds just to
+             * pace a pair of file reads is silly. cells_tick calls the
+             * reader straight. */
+            e->cmd[0] = 0;
             if (!e->interval) e->interval = 20;
             if (e->slim == SLIM_AUTO) e->slim = SLIM_BAR;
             if (e->slim_max <= e->slim_min) { e->slim_min = 0; e->slim_max = 100; }
@@ -1453,6 +1465,7 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "ws_bg")) parse_color(v, &c->ws_bg);
     else if (!strcmp(k, "ws_fg")) parse_color(v, &c->ws_fg);
     else if (!strcmp(k, "ws_other")) c->ws_other = atoi(v);
+    else if (!strcmp(k, "slim_align")) c->slim_align = atoi(v);
     else if (!strcmp(k, "ws_cpu")) c->ws_cpu = atoi(v);
     else if (!strcmp(k, "ws_cpu_interval")) c->ws_cpu_interval = atoi(v);
     else if (!strcmp(k, "ws_cpu_idle")) c->ws_cpu_idle = (float)atof(v);
@@ -2521,6 +2534,77 @@ static void cmus_parse(Cell *e)
     if (t != e->out) memmove(e->out, t, strlen(t) + 1);
 }
 
+/* a leaf with a pid is a window; containers and workspaces are not */
+static bool node_is_view(const JV *n)
+{
+    if (!n || n->type != J_OBJ) return false;
+    if (jint(n, "pid", -1) <= 0) return false;
+    const JV *kids = jget(n, "nodes");
+    if (kids && kids->type == J_ARR && kids->count > 0) return false;
+    return true;
+}
+
+/* Which workspaces a program has a window on. sway knows; this is the same
+ * question the old shell one-liner asked of swaymsg and jq, without either. */
+static void window_scan(const JV *node, const char *want, const char *ws,
+                        char *out, size_t cap, int *found)
+{
+    if (!node || node->type != J_OBJ) return;
+
+    const char *type = jstr(node, "type", "");
+    if (!strcmp(type, "workspace")) ws = jstr(node, "name", "");
+
+    if (node_is_view(node)) {
+        const char *id  = jstr(node, "app_id", "");
+        const char *cls = jstr(jget(node, "window_properties"), "class", "");
+        const char *nm  = jstr(node, "name", "");
+        if (strcasestr(id, want) || strcasestr(cls, want) || strcasestr(nm, want)) {
+            if (ws && *ws) {
+                char one[80];
+                snprintf(one, sizeof(one), "%s%s", *out ? "|" : "", ws);
+                if (strlen(out) + strlen(one) < cap - 1 && !strstr(out, ws))
+                    strcat(out, one);
+            }
+            (*found)++;
+        }
+    }
+    for (int i = 0; i < node->count; ++i) {
+        const JV *kid = node->items[i];
+        if (!kid) continue;
+        if (kid->type == J_ARR)
+            for (int j = 0; j < kid->count; ++j)
+                window_scan(kid->items[j], want, ws, out, cap, found);
+        else if (kid->type == J_OBJ)
+            window_scan(kid, want, ws, out, cap, found);
+    }
+}
+
+static void window_read(Cell *e)
+{
+    e->out[0] = 0;
+    e->state = PS_STOPPED;
+    if (!*e->src_path) return;                   /* nothing to look for */
+
+    JV *tree = sway_query(IPC_GET_TREE);
+    if (!tree) return;
+
+    char list[256] = "";
+    int  found = 0;
+    window_scan(tree, e->src_path, NULL, list, sizeof(list), &found);
+    jfree(tree);
+
+    if (!found) return;                          /* not running: no cell */
+    e->state = PS_PLAYING;
+
+    char cnt[16];
+    snprintf(cnt, sizeof(cnt), "%d", found);
+    const char *vals[] = { e->name, list, cnt };
+    expand_fmt(e->out, sizeof(e->out), *e->src_fmt ? e->src_fmt : "%n [%w]",
+               "nwc", vals);
+    if (*e->hover_fmt)
+        expand_fmt(e->out_hover, sizeof(e->out_hover), e->hover_fmt, "nwc", vals);
+}
+
 /* capacity and status under /sys/class/power_supply: "83+" while it is
  * filling, "83-" while it is not. The sign says the direction, the number says the
  * charge, and neither needs a script. */
@@ -2617,6 +2701,7 @@ static void cell_finish(Cell *e)
 
     if (e->source == SRC_CMUS)    { cmus_parse(e);  e->len = 0; return; }
     if (e->source == SRC_BATTERY) { battery_read(e); e->len = 0; return; }
+    if (e->source == SRC_WINDOW)  { window_read(e);  e->len = 0; return; }
 
     char *t = trim(e->buf);
     for (char *q = t; *q; ++q) if (*q == '\n' || *q == '\r' || *q == '\t') *q = ' ';
@@ -2669,14 +2754,25 @@ static bool cells_read(void)
     return got;
 }
 
+static bool cells_dirty;         /* something changed without a process */
+
 static void cells_tick(void)
 {
     uint32_t t = now_ms();
     for (int i = 0; i < cfg.cell_count; ++i) {
         Cell *e = &cfg.cell[i];
-        if (e->pid > 0 || !*e->cmd) continue;
+        if (e->pid > 0) continue;
         if (e->interval == 0 && e->next_run) continue;       /* run once */
         if (e->next_run && (int32_t)(t - e->next_run) < 0) continue;
+
+        if ((e->source == SRC_BATTERY || e->source == SRC_WINDOW) && !*e->cmd) {
+            if (e->source == SRC_WINDOW) window_read(e);   /* no process */
+            else                         battery_read(e);
+            e->next_run = t + (uint32_t)(e->interval > 0 ? e->interval * 1000 : 5000);
+            cells_dirty = true;
+            continue;
+        }
+        if (!*e->cmd) continue;
         e->next_run = t + 1;
         cell_spawn(e);
     }
@@ -2747,7 +2843,7 @@ static bool cell_is_msg(Cell *e)
 static bool cell_visible(Cell *e)
 {
     if (cell_is_msg(e)) return true;
-    if (!*e->cmd && !*e->fmt && !*e->empty) return false;
+    if (!*e->cmd && !*e->fmt && !*e->empty && e->source == SRC_CMD) return false;
     if (*e->out) return true;
     return *e->empty || !e->hide_empty;      /* a placeholder stays clickable */
 }
@@ -2818,6 +2914,10 @@ struct Bar {
     struct { float x0, x1; char name[128]; } hit[MAX_WORKSPACES];
     int hits;
     bool hover_open;            /* opened by a hover, folds back on leave */
+    float cellx0[MAX_CELLS], cellx1[MAX_CELLS];  /* where each cell sat in the
+                                                    full bar, so the folded
+                                                    strip can line up with it */
+    float wsx0[MAX_WORKSPACES], wsx1[MAX_WORKSPACES];   /* and each workspace */
     struct { float x0, x1; int cell; } chit[MAX_CELLS];
     int chits;
 };
@@ -3086,8 +3186,9 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
     Col c = slim_color_of(e);
     if (mode == SLIM_PRESENCE) {
         /* the cell only exists while its program does, so a block here means
-         * "that one is up" — its own colour, not shared with any gauge */
-        if (!e->has_slim_color) c = cfg.running;
+         * "that one is up". It keeps the colour it has in the full bar —
+         * painting it green regardless meant the same cell was two different
+         * colours depending on whether the bar was folded. */
         fill_rect(cv, x, y, w, h, c);
         return;
     }
@@ -3097,6 +3198,11 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
         localtime_r(&t, &tmv);
         int hour = (tmv.tm_hour + 11) % 12 + 1;    /* 1..12, 0:xx reads as 12 */
         float dot = 3.0f * s, gap = 2.0f * s;
+        if (w > 12.0f * (dot + gap)) {             /* fill the width it was given */
+            float pitch = w / 12.0f;
+            dot = pitch * 0.62f;
+            gap = pitch - dot;
+        }
         /* Every bar up to the hour, so you count them instead of finding the
          * one lit position: 2 at 02:00, still 2 at 02:55.
          *
@@ -3273,8 +3379,27 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
     float tick = 14.0f * s;
     b->hits = 0;
     b->chits = 0;
+    /* Lined up, a workspace keeps the place its button has in the full bar,
+     * so folding does not shuffle them either. Numbers with no workspace have
+     * no button to line up with, so they are simply not there. */
+    bool ws_aligned = cfg.slim_align != 0;
+    if (ws_aligned) {
+        bool any = false;
+        for (int i = 0; i < ws_count && i < MAX_WORKSPACES; ++i)
+            if (b->wsx1[i] > b->wsx0[i]) { any = true; break; }
+        ws_aligned = any;
+    }
+
     for (int i = 1; i <= slots; ++i) {
         Ws *w = ws_by_num(b, i);
+        float sx = x, sw = tick;
+        if (ws_aligned) {
+            if (!w) continue;                      /* nothing to sit under */
+            int wi = (int)(w - ws_list);
+            if (wi < 0 || wi >= MAX_WORKSPACES || b->wsx1[wi] <= b->wsx0[wi]) continue;
+            sx = b->wsx0[wi] * s;
+            sw = (b->wsx1[wi] - b->wsx0[wi]) * s - gap * 0.5f;
+        }
         Col c = cfg.dim;
         c.a = 60;                                  /* empty slot: a faint place holder */
         bool mine = w ? ws_on_bar(b, w) : true;
@@ -3291,24 +3416,24 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
                 else                          { c = cfg.dim;    c.a = 110; }
             }
         }
-        fill_rect(cv, x, y, tick, h, c);
+        fill_rect(cv, sx, y, sw, h, c);
         if (w) {
             int wi = (int)(w - ws_list);
             Col lc; float lf; bool faint;
             if (cpu_load_col(wi, &lc, &lf, &faint)) {
                 /* Three or four dots up the slot. Filling it solid hid which
                  * workspace it was, which is the thing the slot is for. */
-                dot_column(cv, x, y, tick, h, 2.0f * s, 1.0f * s,
+                dot_column(cv, sx, y, sw, h, 2.0f * s, 1.0f * s,
                            faint ? 0.001f : lf, lc);
             }
         }
         if (w && b->hits < MAX_WORKSPACES) {      /* still switchable when folded */
-            b->hit[b->hits].x0 = x / s;
-            b->hit[b->hits].x1 = (x + tick) / s;
+            b->hit[b->hits].x0 = sx / s;
+            b->hit[b->hits].x1 = (sx + sw) / s;
             str_set(b->hit[b->hits].name, sizeof(b->hit[b->hits].name), w->name);
             b->hits++;
         }
-        x += tick + gap;
+        if (!ws_aligned) x += tick + gap;
     }
 
     if (!cfg.cell_count) {                         /* status_command fallback */
@@ -3342,9 +3467,32 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
     }
     float rx = (float)cv->w - 4.0f * s - total;
     if (rx < x + gap) rx = x + gap;
+
+    /* Folded, a cell can sit under the middle of where it is in the full bar
+     * instead of being packed against the right edge. Toggling then does not
+     * move anything, so the clock is where the clock was and you can hit it
+     * without looking. Falls back to packing until the full bar has been
+     * drawn once, and wherever two marks would overlap. */
+    /* Aligned, a mark takes its cell's whole place — same left edge, same
+       width — so folding changes the height of the bar and nothing else. */
+    float px[MAX_CELLS], pw[MAX_CELLS];
+    bool  aligned = cfg.slim_align != 0;
+    if (aligned) {
+        for (int k = 0; k < n && aligned; ++k) {
+            float c0 = b->cellx0[idx[k]] * s, c1 = b->cellx1[idx[k]] * s;
+            if (c1 <= c0) { aligned = false; break; }        /* never measured */
+            if (c0 < x + gap) c0 = x + gap;
+            if (c1 > (float)cv->w - 3.0f * s) c1 = (float)cv->w - 3.0f * s;
+            if (c1 - c0 < 4.0f * s) { aligned = false; break; }
+            px[k] = c0;
+            pw[k] = c1 - c0 - gap * 0.5f;
+        }
+    }
+
     for (int k = 0; k < n; ++k) {
-        float w = slim_width_of(&cfg.cell[idx[k]], mode[k], s);
-        if (k) rx += join[k] ? 1.0f * s : gap;
+        float w = aligned ? pw[k] : slim_width_of(&cfg.cell[idx[k]], mode[k], s);
+        if (aligned) rx = px[k];
+        else if (k)  rx += join[k] ? 1.0f * s : gap;
         if (rx + w > (float)cv->w - 3.0f * s) break;
         slim_draw_one(cv, &cfg.cell[idx[k]], mode[k], rx, y, w, h, s);
         if (b->chits < MAX_CELLS) {               /* buttons keep working */
@@ -3467,6 +3615,10 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
             b->hit[b->hits].x1 = (x + bwid) / s;
             str_set(b->hit[b->hits].name, sizeof(b->hit[b->hits].name), w->name);
             b->hits++;
+        }
+        if (i < MAX_WORKSPACES) {                 /* for the folded strip */
+            b->wsx0[i] = x / s;
+            b->wsx1[i] = (x + bwid) / s;
         }
         x += bwid + (float)cfg.ws_gap * s;
     }
@@ -3708,6 +3860,10 @@ static float draw_group_(Canvas *cv, Bar *b, Font *f, int g, float y0, float vis
             }
             canvas_clip(cv, ox0, cv->cy0, ox1, cv->cy1);
 
+            if (it->cell >= 0 && it->cell < MAX_CELLS) {   /* for the strip */
+                b->cellx0[it->cell] = x / s;
+                b->cellx1[it->cell] = (x + bw[k]) / s;
+            }
             if (b->chits < MAX_CELLS) {
                 b->chit[b->chits].x0 = x / s;
                 b->chit[b->chits].x1 = (x + bw[k]) / s;
@@ -4453,6 +4609,9 @@ static void usage(void)
 "                      bars while playing, one dim one when not\n"
 "  NAME.slim_color=    override this cell's colour on the strip. Without it\n"
 "                      the strip reuses the colour the cell's own text has\n"
+"  NAME.source=window  asks sway which workspaces have a window of\n"
+"                      NAME.program= and prints them: mpv [3|5]. %n the\n"
+"                      name, %w the workspaces, %c the count\n"
 "  NAME.source=battery reads capacity and status out of /sys itself and\n"
 "                      prints 83+ while it is filling, 83- while it is not,\n"
 "                      83= when it is full. NAME.bat_path= points it at a\n"
@@ -4887,6 +5046,7 @@ int main(int argc, char **argv)
         if (status_read()) redraw = true;
         cells_tick();
         if (cells_read()) redraw = true;
+        if (cells_dirty) { cells_dirty = false; redraw = true; }
         if (msg_read()) redraw = true;
         if (ctrl_req) {
             for (int i = 0; i < output_count; ++i) {

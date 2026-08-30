@@ -7,6 +7,8 @@ what is going on.
 
 ![swbr](screenshot.png)
 
+![swbr, folded](screenshot-slim.png)
+
 100% vibecode, but tested.
 
 ## Build
@@ -18,12 +20,9 @@ make install          # ~/.local/bin, or PREFIX=/usr/local
 make config           # optional: config.example -> ~/.config/swbr/config
 ```
 
-`libwayland-client` is the only library it links. The wlr-layer-shell protocol
-glue is vendored, so there is no `wayland-scanner` step. Fonts come from
-`stb_truetype.h`, also vendored.
-
-Needs a running sway session (`$SWAYSOCK`) and any TTF font. `fc-match` is used
-to pick one if it is there.
+`libwayland-client` is the only library it links. The layer-shell protocol glue
+and the font rasteriser are vendored, so there is no `wayland-scanner` step.
+Needs a running sway session (`$SWAYSOCK`) and any TTF font.
 
 ## Use
 
@@ -31,16 +30,15 @@ to pick one if it is there.
 exec_always swbr --replace
 ```
 
-`--replace` terminates a bar that is already running and waits for it to go,
-which is what you want on a sway reload. Do not use `pkill swbr` on a separate
-line for this: sway forks each `exec_always` without waiting for it, so the
-kill and the new bar race each other and the kill usually wins — which looks
-exactly like the bar refusing to start.
+`--replace` terminates a bar that is already running and waits for it to go.
+Use it instead of a separate `pkill swbr` line: sway forks each `exec_always`
+without waiting, so a kill on one line races the bar started on the next and
+usually wins.
 
 | | |
 | --- | --- |
 | left click a workspace | switch to it |
-| hover the bar, press `space` | fold it into the signal strip, and back |
+| hover the bar, press `space` | fold it into the strip, and back |
 | click a cell | run its `button1=` command |
 | `pkill -USR1 swbr` | fold or unfold every bar |
 
@@ -60,186 +58,110 @@ vol.button1=pavucontrol
 bar={workspaces||vol,clock}
 ```
 
-`bar=` is one line that places everything: `||` splits left / center / right,
-`,` separates cells, `(a,b)` glues two together. Keep it last in the config.
+`bar=` places everything: `||` splits left / center / right, `,` separates
+cells, `(a,b)` glues two together. Keep it last in the config.
+
+## Sources
+
+Some cells need no script. `source=` fills them in directly; setting `cmd=` on
+the same cell switches it back to your own command.
+
+```
+cell=cmus                 cell=battery              cell=mpv
+cmus.source=cmus          battery.source=battery    mpv.source=window
+                                                    mpv.program=mpv
+```
+
+**cmus** runs `cmus-remote -Q` and reads the `status` line, so playing and
+paused are facts rather than a guess at what a script printed. Prints
+`▶ Artist — Title` or `⏸ …`, nothing when cmus is stopped. Left click toggles
+pause, middle skips forward, right goes back. `cmus_fmt`: `%i` icon, `%n`
+artist — title, `%a`, `%t`, `%s`; default `%i %n`. Two cells work — one `%i`,
+one `%n` — if you want the icon separate from the title.
+
+**battery** reads `/sys/class/power_supply`: `83+` filling, `83-` draining, no
+sign when full. `bat_path=` picks one if yours is not `BAT0` or you have two.
+`src_fmt`: `%c` capacity, `%i` sign, `%w` watts now, `%h` hours left, `%s` the
+word — `%c%i %w %h` gives `83- 21.5W 1.7h`.
+
+**window** asks sway which workspaces have a window of `program=` and prints
+`mpv [3|5]`. Matched against the app id, the X11 class, then the title.
+`src_fmt`: `%n` the cell's name, `%w` the workspaces, `%c` the count.
 
 ## Folded
 
-`space` over the bar folds it to a few pixels. The strip keeps saying
-something.
-
-![swbr, folded](screenshot-slim.png)
+`space` over the bar folds it to a few pixels.
 
 | `NAME.slim=` | on the strip |
 | --- | --- |
 | `tick` | a block, on while the cell has output |
 | `bar` | a gauge, `slim_min`–`slim_max` |
-| `clock` | twelve bars, lit up to the hour — two at 02:00, still two at 02:55, softer before noon |
-| `presence` | a block in the `running` colour, there only while the program is |
-| `media` | a full block while playing, a short dim one when paused, nothing when stopped |
+| `clock` | twelve bars lit up to the hour, softer before noon |
+| `presence` | a block, there only while the program is |
+| `media` | a full block playing, a short dim one paused, nothing stopped |
 | `auto` | pick from what the cell prints |
 | `off` | nothing |
 
-A cell keeps its own colour when folded, markup included, so a green "playing"
-glyph stays green down there. `slim_color` overrides it, `slim_color2` is the
-second one a clock uses for its minutes. `slim_on=` says which output counts as
-playing for `slim=media` — it has to match what your command prints. Without
-it swbr guesses from the usual glyphs and the words "playing" and "paused",
-which only helps if your player happens to print one of them.
+A cell keeps its own colour when folded, markup included. `slim_color`
+overrides it, `slim_color2` is the clock's minutes. For `slim=media` on a plain
+command cell, `slim_on=` says which output counts as playing; a `source=` cell
+already knows.
 
-For cmus there is no guessing:
+`slim_align=1` (the default) gives each mark its cell's whole place — same left
+edge, same width — so folding changes the height of the bar and nothing else.
+`slim_align=0` packs them against the right edge instead.
 
-```
-cell=music
-music.source=cmus
-```
-
-Two cells, if you want the icon separate from the title:
-
-```
-cell=cmusui
-cmusui.source=cmus
-cmusui.cmus_fmt=%i          # just ▶ or ⏸
-
-cell=cmus
-cmus.source=cmus
-cmus.cmus_fmt=%n            # just Artist — Title
-cmus.slim=off
-```
-
-`cmus_fmt` understands `%i` (the icon, which follows the real state), `%n`
-(artist — title, or just the title), `%a`, `%t` and `%s` (the word playing or
-paused). The default is `%i %n`.
-
-That is the whole config, and `source=cmus` sets the command itself — a
-`music.cmd=` from an older config would leave swbr parsing a script's output
-instead of cmus's own, so setting one switches the cell back to a plain
-command. swbr runs `cmus-remote -Q` and reads the `status` line, so playing and paused are facts, not a guess at what a script
-printed. The bar shows `▶ Artist — Title` or `⏸ Artist — Title`, the icon
-following the actual state, and the cell disappears when cmus is stopped or
-not running. Left click toggles pause, middle skips forward, right goes back;
-`music.cmd=`, `music.interval=` and the binds override any of it.
-
-`swbr --probe` prints what it decided for every cell, and the text it decided
-it from:
-
-```
-cell music      iv=2  min_w=0  sep=1  '♪ Boards of Canada — Roygbiv'
-            slim=media  playing=yes  slim_on unset, guessing from the text
-```
-
-`signals=0` turns the whole thing off and leaves a plain strip.
-
-## Battery
-
-```
-cell=battery
-battery.source=battery
-```
-
-Reads capacity and status out of `/sys/class/power_supply` itself: `83+` while
-it is filling, `83-` while it is draining, and no sign at all when it is full,
-since nothing is happening. The sign
-carries the direction, so there is no percent sign spending width. `slim=bar`
-and the 0–100 range are set for you.
-
-Not every machine calls it `BAT0`, so it takes the first thing with a
-`capacity` file, preferring one named `BAT*`. Point it elsewhere with
-`battery.bat_path=/sys/class/power_supply/BAT1` — which is also how you pick
-one of two — and lay it out with `battery.src_fmt=`: `%c` capacity, `%i` the
-sign, `%w` what it is drawing right now in watts, `%h` how long that leaves,
-`%s` the word. `battery.src_fmt=%c%i %w %h` gives `83- 21.5W 1.7h`.
-
-The watts and the hours come from `energy_now`/`power_now` where the kernel
-reports those, and from `charge_now`/`current_now`/`voltage_now` where it does
-not; whichever pair exists gives both numbers, and they are simply left empty
-when neither does.
-
-None of this takes anything away. Setting `battery.cmd=` switches the cell
-back to your own script, as with any other cell; `source=` and `cmd=` are the
-two ways of filling a cell, and whichever comes last in the config wins.
-
-## Other monitors
-
-`ws_other=1` adds the workspaces from your other screens to the bar, drawn as
-short pills sitting on the bar's bottom edge at a little over half height, in
-type a fifth smaller and a little see-through. It is on in the shipped config.
-
-Folded, they take a slot like any other workspace but never this screen's
-emphasis — focused on the other monitor is not focused here, so the brightest
-they ever get is a soft accent. They stay
-readable and clickable, and nothing about them looks like it belongs to this
-screen.
+`signals=0` leaves a plain strip.
 
 ## Hover
 
-`NAME.hover=` is what a cell shows while the pointer is on it — the same
-placeholders its source understands, or `%s` for a plain command's output:
+`NAME.hover=` is what a cell shows while the pointer is on it, with the same
+placeholders its source understands, or `%s` for a command's output:
 
 ```
 battery.hover=%c%i  %w  %h     # 83-  21.5W  1.7h
 battery.hover_slim=1
 ```
 
-The cell is measured with that text, so it grows to fit instead of
-truncating. Folded there is nowhere to put it, so `hover_slim=1` opens the bar
-for as long as you rest on that cell and folds it back when you leave.
+The cell is measured with that text, so it grows to fit. Folded there is
+nowhere to put it, so `hover_slim=1` opens the bar while you rest on that cell.
 
 ## Load per workspace
 
-A column of dots up the right edge of each workspace button says how much
-processor time the windows on that workspace are using: one lit when it is
-idling, all of them when something is working. Dots rather than a solid fill,
-so the button's own colour still reads through the gaps — six of them on a
-30 px bar, three in the folded strip, where the same dots run up the workspace
-slot.
-
-The scale is in **cores**: `1.0` is one core kept busy, and `ws_cpu_full=4`
-means four cores fill the column. A share of the whole machine was the wrong
-unit — on sixteen threads a browser pinning two cores is twelve percent, which
-rounded to nothing, and nobody thinks about their machine that way.
-
-Anything alive but below the scale gets a single faint dot rather than
-nothing, so a workspace that is *doing* something never looks asleep — a
-player, a polling script, a shell running something small. A terminal sitting
-at a prompt still gets nothing, which is the distinction that matters.
+A column of dots up the right edge of each workspace button, and up its slot in
+the folded strip. The scale is in **cores**: `1.0` is one core kept busy,
+`ws_cpu_full=4` fills the column.
 
 ```
 0.000 cores  ......   a terminal at a prompt
 0.02         +.....   cmus playing
-0.09         +.....   a script polling every second
 0.4          #.....   mpv decoding
 1.9          ###...   a browser working
 4.0          ######   make -j4
 ```
 
-`ws_cpu_idle` is where "nothing" ends and that faint dot begins.
-
-They keep one colour — `accent`, held back towards `dim` — and only tip
-towards `urgent` when a workspace is really pinned, so it is the count and not
-the hue that carries the load. `hl` is what paints the focused workspace, so
-nothing here goes near it.
+Anything alive but below the scale gets one faint dot, so a workspace that is
+doing something never looks asleep; `ws_cpu_idle` is where that starts.
 
 swbr asks sway which window belongs to which workspace, reads `/proc`, and
-credits every process to the nearest ancestor that owns a window — so a build
-running in a terminal counts towards the workspace that terminal is on. Each
-process is measured by its own cpu time *plus* the time of the children it has
-already reaped, which is what makes a build show up at all: every compiler
-process lives for a moment and is gone long before the next sample, and its
-time only survives in its parent's totals.
-Anything with no window above it, a daemon or the session itself, belongs to
-no workspace and is left out. The colour runs from `running` through
-`slim_warm` into `urgent`.
+credits each process to the nearest ancestor that owns a window — a build in a
+terminal counts towards that terminal's workspace. Each process is measured by
+its own cpu time plus the time of the children it has reaped, which is what
+makes a build show up at all: every compiler process is gone before the next
+sample, and its time only survives in its parent's totals.
 
 ```
 ws_cpu=1  ws_cpu_interval=3  ws_cpu_idle=0.01  ws_cpu_min=0.25  ws_cpu_full=4
 ```
 
-The numbers are written to `$XDG_RUNTIME_DIR/swbr-cpu` so swov can show the
-same thing on its tiles without measuring anything itself — a rate needs two
-samples seconds apart, and swov is only on screen for a moment. `swbr --probe`
-prints what it last measured, and how many windows it found in sway's tree to
-attribute work to — if that count is zero, nothing can ever show.
+The numbers go to `$XDG_RUNTIME_DIR/swbr-cpu` so swov can draw the same thing
+without measuring anything itself.
+
+## Other monitors
+
+`ws_other=1` adds the workspaces from your other screens as short pills on the
+bar's bottom edge, in smaller, dimmer type. Folded they take a slot like any
+other, but never this screen's emphasis.
 
 ## Messages
 
@@ -261,7 +183,7 @@ key is also a command line option:
 ```sh
 swbr position=bottom height=32
 swbr --dump-config > ~/.config/swbr/config
-swbr --probe        # outputs, sizes, font metrics and what each cell prints
+swbr --probe        # outputs, sizes, font metrics, and what every cell decided
 ```
 
 `config.example` lists everything with defaults. The ones worth knowing:
@@ -272,24 +194,19 @@ swbr --probe        # outputs, sizes, font metrics and what each cell prints
 | `exclusive` | `1` = reserve the space, `0` = float above the windows |
 | `min_width`, `align_x`, `side_margin` | a floating bar sizes itself to its content |
 | `radius` | corner radius; the corners at the screen edge stay square |
-| `outputs` | which monitors get a bar |
-| `ws_names`, `ws_inset`, `ws_radius` | workspace buttons: numbers or names, pills or blocks |
+| `outputs`, `ws_other` | which monitors get a bar, and whose workspaces show |
+| `ws_names`, `ws_inset`, `ws_radius` | numbers or names, pills or blocks |
 | `font`, `font_alt`, `ui_scale`, `text_px` | text |
 | `markup` | the pango subset: `<span foreground=..>`, `<b>`, `&amp;` |
 | `hide_key`, `collapsed_px`, `anim_ms` | folding |
-| `signals`, `slim_ws_slots`, `slim_warm` | what the folded strip shows |
+| `signals`, `slim_align`, `slim_ws_slots` | what the folded strip shows |
 | `status_command` | i3bar-style status, used when no cells are configured |
 
-### Shared config
-
-Colours and fonts for swbr, swov and appwheel can be set once in
-`${XDG_CONFIG_HOME:-~/.config}/sw/config`, using role names (`surface`,
-`accent`, `hl`, ...) that each program maps onto its own keys. `sw_theme.h`
-lists them all.
-
-Keys written before any section go to all three programs; a `[swbr]` section
-goes to swbr only and takes its own key names as well. The config above is read
-afterwards, so it always wins, and the command line wins over that.
+Colours and fonts for swbr, swov and swas can be set once in
+`${XDG_CONFIG_HOME:-~/.config}/sw/config` under role names (`surface`,
+`accent`, `hl`, …) that each program maps onto its own keys; `sw_theme.h` has
+the table. Keys before any section go to all three, a `[swbr]` section to swbr
+only. This config is read afterwards and wins, the command line wins over that.
 
 ## Notes
 

@@ -167,6 +167,65 @@ static void expand_tilde(const char *in, char *out, size_t n)
     snprintf(out, n, "%s", in);
 }
 
+/* ----------------------------------------------- cursor-shape-v1 glue */
+/* Vendored equivalent of what wayland-scanner emits for
+ * cursor-shape-v1.xml. Two interfaces and two requests: ask the compositor
+ * for a named cursor over our surface, rather than shipping a cursor theme
+ * and drawing one ourselves. Absent on an older compositor, in which case
+ * nothing here runs and the pointer keeps whatever shape it had. */
+
+struct wp_cursor_shape_manager_v1;
+struct wp_cursor_shape_device_v1;
+
+extern const struct wl_interface wp_cursor_shape_device_v1_interface;
+
+static const struct wl_interface *swbr_cs_types[] = {
+    NULL, NULL,
+    &wp_cursor_shape_device_v1_interface,
+    &wl_pointer_interface,
+    NULL, NULL,
+};
+
+static const struct wl_message wp_cursor_shape_manager_v1_requests[] = {
+    { "destroy", "", swbr_cs_types + 0 },
+    { "get_pointer", "no", swbr_cs_types + 2 },
+    { "get_tablet_tool_v2", "no", swbr_cs_types + 4 },
+};
+static const struct wl_interface wp_cursor_shape_manager_v1_interface = {
+    "wp_cursor_shape_manager_v1", 1, 3, wp_cursor_shape_manager_v1_requests, 0, NULL,
+};
+
+static const struct wl_message wp_cursor_shape_device_v1_requests[] = {
+    { "destroy", "", swbr_cs_types + 0 },
+    { "set_shape", "uu", swbr_cs_types + 0 },
+};
+const struct wl_interface wp_cursor_shape_device_v1_interface = {
+    "wp_cursor_shape_device_v1", 1, 2, wp_cursor_shape_device_v1_requests, 0, NULL,
+};
+
+enum wp_cursor_shape_device_v1_shape {
+    WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT = 1,
+    WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER = 4,
+};
+
+static struct wp_cursor_shape_device_v1 *
+wp_cursor_shape_manager_v1_get_pointer(struct wp_cursor_shape_manager_v1 *m,
+                                       struct wl_pointer *p)
+{
+    struct wl_proxy *id = wl_proxy_marshal_flags(
+        (struct wl_proxy *)m, 1, &wp_cursor_shape_device_v1_interface,
+        wl_proxy_get_version((struct wl_proxy *)m), 0, NULL, p);
+    return (struct wp_cursor_shape_device_v1 *)id;
+}
+
+static void wp_cursor_shape_device_v1_set_shape(struct wp_cursor_shape_device_v1 *d,
+                                                uint32_t serial, uint32_t shape)
+{
+    wl_proxy_marshal_flags((struct wl_proxy *)d, 1, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)d), 0,
+                           serial, shape);
+}
+
 /* ------------------------------------------------- wlr-layer-shell glue */
 /* Vendored equivalent of what wayland-scanner emits for
  * wlr-layer-shell-unstable-v1.xml (Copyright (c) 2017 Drew DeVault, MIT-ish;
@@ -1073,6 +1132,15 @@ typedef struct {
     char  hover_fmt[192];        /* what to show while the pointer is on it  */
     char  hover_cmd[256];        /* ...or the output of this, run on hover   */
     int   hover_cal;             /* ...or a month, with today marked         */
+    int   hover_click;           /* opened by clicking, not by pointing      */
+
+    /* Shouting when the battery is going flat: a level is armed until it is
+     * crossed on the way down, and rearms when the charge comes back up past
+     * it or the cable goes in. */
+    int   alert_lv[8], alert_n, alert_fired;
+    char  alert_msg[192], alert_cmd[256], alert_play[128];
+    int   alert_tone, alert_ms, alert_beeps, alert_escalate;
+    int   cal_off;               /* months away from this one, from the arrows */
     char  out_hover[512];        /* that, already filled in                  */
     int   hover_slim;            /* folded, hovering it opens the bar        */
     int   state;                 /* what that player is doing: PS_*          */
@@ -1133,7 +1201,7 @@ typedef struct {
     Cell cell[MAX_CELLS];
     int  cell_count;
     char msg_fifo[PATH_MAX], msg_target[32];
-    int  msg_timeout, msg_flash;
+    int  msg_timeout, msg_flash, msg_panel;
     Col  msg_info, msg_warn, msg_error;
     int  cell_gap, cell_inset, slim_ws_slots;
     float cell_radius;
@@ -1201,6 +1269,7 @@ static void config_defaults(Config *c)
     c->cell_radius = 5.0f;
     c->msg_timeout = 8;
     c->msg_flash = 1;
+    c->msg_panel = 3;
     c->msg_info  = (Col){ 0x89, 0xaf, 0xc4, 0xff };
     c->msg_warn  = (Col){ 0xcb, 0x9b, 0x00, 0xff };
     c->msg_error = (Col){ 0xe0, 0x53, 0x3c, 0xff };
@@ -1269,6 +1338,11 @@ static Cell *cell_add(Config *c, const char *name)
     e->sep = 1;
     e->fd = -1;
     e->pid = -1;
+    e->alert_tone = 250;         /* the low one: it carries without startling */
+    e->alert_ms = 1050;
+    e->alert_beeps = 2;
+    e->alert_escalate = 1;
+    str_set(e->alert_play, sizeof(e->alert_play), "aplay -q -f cd -");
     str_set(e->align, sizeof(e->align), "right");
     str_set(e->pos, sizeof(e->pos), "right");
     return e;
@@ -1306,6 +1380,30 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
     else if (!strcmp(k, "hover")) str_set(e->hover_fmt, sizeof(e->hover_fmt), v);
     else if (!strcmp(k, "hover_cmd")) str_set(e->hover_cmd, sizeof(e->hover_cmd), v);
     else if (!strcmp(k, "hover_cal")) e->hover_cal = atoi(v);
+    else if (!strcmp(k, "hover_click")) e->hover_click = atoi(v);
+    else if (!strcmp(k, "alert")) {
+        e->alert_n = 0;
+        char tmp[128];
+        str_set(tmp, sizeof(tmp), v);
+        for (char *tok = strtok(tmp, ","); tok && e->alert_n < 8; tok = strtok(NULL, ",")) {
+            char *t = trim(tok);
+            if (*t == '<') ++t;
+            if (*t) e->alert_lv[e->alert_n++] = atoi(t);
+        }
+        for (int i = 1; i < e->alert_n; ++i)          /* highest first */
+            for (int j = i; j > 0 && e->alert_lv[j] > e->alert_lv[j - 1]; --j) {
+                int t2 = e->alert_lv[j]; e->alert_lv[j] = e->alert_lv[j - 1];
+                e->alert_lv[j - 1] = t2;
+            }
+        e->alert_fired = 0;
+    }
+    else if (!strcmp(k, "alert_msg")) str_set(e->alert_msg, sizeof(e->alert_msg), v);
+    else if (!strcmp(k, "alert_cmd")) str_set(e->alert_cmd, sizeof(e->alert_cmd), v);
+    else if (!strcmp(k, "alert_play")) str_set(e->alert_play, sizeof(e->alert_play), v);
+    else if (!strcmp(k, "alert_tone")) e->alert_tone = atoi(v);
+    else if (!strcmp(k, "alert_ms")) e->alert_ms = atoi(v);
+    else if (!strcmp(k, "alert_beeps")) e->alert_beeps = atoi(v);
+    else if (!strcmp(k, "alert_escalate")) e->alert_escalate = atoi(v);
     else if (!strcmp(k, "hover_slim")) e->hover_slim = atoi(v);
     else if (!strcmp(k, "source")) {
         if (!strcasecmp(v, "cmus")) {
@@ -1443,6 +1541,7 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "msg_target")) str_set(c->msg_target, sizeof(c->msg_target), v);
     else if (!strcmp(k, "msg_timeout")) c->msg_timeout = atoi(v);
     else if (!strcmp(k, "msg_flash")) c->msg_flash = atoi(v);
+    else if (!strcmp(k, "msg_panel")) c->msg_panel = atoi(v);
     else if (!strcmp(k, "msg_info")) parse_color(v, &c->msg_info);
     else if (!strcmp(k, "msg_warn")) parse_color(v, &c->msg_warn);
     else if (!strcmp(k, "msg_error")) parse_color(v, &c->msg_error);
@@ -2251,6 +2350,7 @@ static void layout_parse(const char *spec)
 static char msg_text[512] = "";
 static int  msg_level = 0;                    /* 0 info, 1 warn, 2 error */
 static uint32_t msg_until = 0;                /* 0 = stays until cleared */
+static uint32_t msg_at = 0;                   /* when it arrived */
 static char msg_path[PATH_MAX] = "";
 static int  msg_fd = -1;
 static char msg_buf[1024];
@@ -2309,6 +2409,7 @@ static void msg_set(const char *line)
     str_set(msg_text, sizeof(msg_text), t);
     msg_level = lvl;
     msg_until = cfg.msg_timeout > 0 ? now_ms() + (uint32_t)cfg.msg_timeout * 1000u : 0;
+    msg_at = now_ms();
 }
 
 /* Take over from a bar that is already running.
@@ -2626,6 +2727,100 @@ static double bat_num(const char *base, const char *leaf)
     return atof(t);
 }
 
+/* A note, written as raw PCM into whatever plays it.
+ *
+ * A sine with a raised-cosine edge either side, so it starts and stops
+ * without the click a square burst makes — `speaker-test` is a test tone, not
+ * a notification. Everything happens in a detached child: a battery warning
+ * must never hold up the bar. */
+/* urgency 0 is an ordinary level, 1 the one before last, 2 the last: longer
+ * and more of them, so the difference is audible from the next room without
+ * having to count. */
+static void alert_play_tone(const Cell *e, int urgency)
+{
+    if (e->alert_tone <= 0 || !*e->alert_play) return;
+
+    pid_t p = fork();
+    if (p < 0) return;
+    if (p > 0) { waitpid(p, NULL, 0); return; }
+
+    if (fork() > 0) _exit(0);                    /* orphan it, no zombie */
+
+    FILE *out = popen(e->alert_play, "w");
+    if (!out) _exit(0);
+
+    const int rate = 44100;
+    int ms = e->alert_ms > 0 ? e->alert_ms : 1050;
+    int beeps = e->alert_beeps > 0 ? e->alert_beeps : 1;
+    if (e->alert_escalate && urgency == 1) { beeps += 1; ms = ms * 6 / 5; }
+    if (e->alert_escalate && urgency >= 2) { beeps += 3; ms = ms * 8 / 5; }
+
+    int n  = rate * ms / 1000;
+    int edge = rate * 15 / 1000;                 /* 15 ms in and out */
+    int gap = rate * 130 / 1000;
+
+    for (int b = 0; b < beeps; ++b) {
+        for (int i = 0; i < n; ++i) {
+            double env = 1.0;
+            if (i < edge)          env = 0.5 - 0.5 * cos(M_PI * i / edge);
+            else if (i > n - edge) env = 0.5 - 0.5 * cos(M_PI * (n - i) / edge);
+            double v = sin(2.0 * M_PI * e->alert_tone * i / rate) * env * 0.35;
+            int16_t sm = (int16_t)(v * 32767.0);
+            fwrite(&sm, 2, 1, out);
+            fwrite(&sm, 2, 1, out);              /* both ears */
+        }
+        if (b + 1 < beeps) {
+            int16_t z = 0;
+            for (int i = 0; i < gap; ++i) { fwrite(&z, 2, 1, out); fwrite(&z, 2, 1, out); }
+        }
+    }
+    pclose(out);
+    _exit(0);
+}
+
+static void alert_fire(Cell *e, int level, const char *cap, bool last,
+                       int urgency)
+{
+    if (*e->alert_msg) {
+        char line[320], body[256];
+        const char *vals[] = { cap };
+        expand_fmt(body, sizeof(body), e->alert_msg, "c", vals);
+        snprintf(line, sizeof(line), "%s %s", last ? "error:" : "warning:", body);
+        msg_set(line);
+    }
+    if (*e->alert_cmd) {
+        char cmd[320];
+        const char *vals[] = { cap };
+        expand_fmt(cmd, sizeof(cmd), e->alert_cmd, "c", vals);
+        run_command(cmd);
+    }
+    alert_play_tone(e, urgency);
+    (void)level;
+}
+
+/* Levels are crossed on the way down, once each, and rearm on the way back
+ * up — the same idea as the shell script's counter file, without the file. */
+static void alert_check(Cell *e, int cap, bool discharging)
+{
+    if (!e->alert_n) return;
+
+    if (!discharging) { e->alert_fired = 0; return; }
+
+    for (int i = 0; i < e->alert_n; ++i)
+        if (cap > e->alert_lv[i] + 2 && (e->alert_fired & (1 << i)))
+            e->alert_fired &= ~(1 << i);         /* charge came back */
+
+    for (int i = 0; i < e->alert_n; ++i) {
+        if (cap > e->alert_lv[i] || (e->alert_fired & (1 << i))) continue;
+        e->alert_fired |= 1 << i;
+        char c[16];
+        snprintf(c, sizeof(c), "%d", cap);
+        int urgency = i == e->alert_n - 1 ? 2 : i == e->alert_n - 2 ? 1 : 0;
+        alert_fire(e, e->alert_lv[i], c, i == e->alert_n - 1, urgency);
+        break;                                   /* one level per sample */
+    }
+}
+
 static void battery_read(Cell *e)
 {
     char base[320] = "";
@@ -2683,6 +2878,8 @@ static void battery_read(Cell *e)
     bool up   = full || !strcasecmp(st, "Charging");
     e->state  = up ? PS_PLAYING : PS_PAUSED;     /* reused: filling or not */
 
+    alert_check(e, atoi(c), !up);
+
     if (rate_u > 0 && now_u >= 0) {
         double left_u = up ? (full_u > now_u ? full_u - now_u : 0) : now_u;
         double h = left_u / rate_u;
@@ -2692,11 +2889,21 @@ static void battery_read(Cell *e)
     /* %c capacity, %i the sign, %w watts, %h hours left, %s the word.
      * Full gets no sign at all: nothing is happening, so nothing is said. */
     const char *sign = full ? "" : up ? "+" : "-";
-    const char *vals[] = { c, sign, watts, hours, st };
+    /* Half an hour means nothing on its own: on the cable it is time to
+     * full, off it is time to empty, and those are opposite news. */
+    const char *ends = !*hours ? "" : up ? "to full" : "left";
+
+    const char *vals[] = { c, sign, watts, hours, st, ends };
     expand_fmt(e->out, sizeof(e->out), *e->src_fmt ? e->src_fmt : "%c%i",
-               "ciwhs", vals);
-    if (*e->hover_fmt)
-        expand_fmt(e->out_hover, sizeof(e->out_hover), e->hover_fmt, "ciwhs", vals);
+               "ciwhse", vals);
+    if (*e->hover_fmt) {
+        expand_fmt(e->out_hover, sizeof(e->out_hover), e->hover_fmt, "ciwhse", vals);
+        /* Full, or a kernel that reports no rate: the format collapses to
+         * blanks, and a panel with nothing in it is worse than the word. */
+        const char *p = e->out_hover;
+        while (*p == ' ') ++p;
+        if (!*p) str_set(e->out_hover, sizeof(e->out_hover), st);
+    }
 }
 
 static void cell_finish(Cell *e)
@@ -2913,8 +3120,14 @@ struct Bar {
     bool hover_open;            /* opened by a hover, folds back on leave */
     bool measured_full;         /* the open layout has been worked out once */
     int  tip_showing;           /* the cell whose panel is open, or -1      */
+    int  tip_pinned;            /* ...and it was opened by a click          */
+    bool tip_msg;               /* the panel is showing a message           */
     float tip_cx;               /* the middle of that cell, logical px      */
     uint32_t tip_at;            /* when it opened, for the slide            */
+    int reg_w, reg_y, reg_h;    /* the input region as the compositor has it */
+    int tip_edge;               /* -1 the panel is flush left, +1 right, 0 no */
+    uint32_t last_fit;          /* when we last asked for a new size         */
+    float cal_x0, cal_x1, cal_x2, cal_x3, cal_y0, cal_y1;  /* the ‹ › boxes */
     int  tip_h;                 /* extra surface for the hover text, logical */
     int  tip_cell;              /* which cell it belongs to, or -1          */
     float cellx0[MAX_CELLS], cellx1[MAX_CELLS];  /* where each cell sat in the
@@ -3364,9 +3577,15 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
     float gap = 3.0f * s;
     float x = 4.0f * s;
 
-    if (msg_active() && cfg.msg_flash) {          /* an error is worth the whole strip */
-        fill_rect(cv, x, y, (float)cv->w - 8.0f * s, h, msg_color());
-        return;
+    /* A message used to paint the whole strip its colour and leave it there,
+     * which reads as "the bar is broken" rather than "look at this". It
+     * pulses over the strip you already had instead, and the text itself
+     * drops down in the panel for a few seconds. */
+    float blink = 0.0f;
+    if (msg_active() && cfg.msg_flash) {
+        uint32_t ph = now_ms() % 900;
+        blink = 0.18f + 0.50f *
+                (0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)ph / 900.0f));
     }
 
     /* one fixed slot per workspace number, so slot 3 is always workspace 3 */
@@ -3486,9 +3705,12 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
             if (c1 <= c0) { aligned = false; break; }        /* never measured */
             if (c0 < x + gap) c0 = x + gap;
             if (c1 > (float)cv->w - 3.0f * s) c1 = (float)cv->w - 3.0f * s;
-            if (c1 - c0 < 4.0f * s) { aligned = false; break; }
-            px[k] = c0;
-            pw[k] = c1 - c0 - gap * 0.5f;
+            /* inset by the same padding the text has, so the mark lines up
+               with the words that were there a moment ago */
+            float cpad = (float)cfg.cell[idx[k]].pad * s;
+            if (c1 - c0 - 2.0f * cpad < 4.0f * s) { aligned = false; break; }
+            px[k] = c0 + cpad;
+            pw[k] = c1 - c0 - 2.0f * cpad;
         }
     }
 
@@ -3506,6 +3728,10 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
         }
         rx += w;
     }
+
+    if (blink > 0.0f)                            /* over the top, last */
+        fill_rect(cv, x, y, (float)cv->w - 8.0f * s, h,
+                  col_scale_alpha(msg_color(), blink));
 }
 /* --------------------------------------------------------------- workspaces
  * The buttons are a placeable item like any cell, so they are measured and
@@ -3985,7 +4211,18 @@ static void bar_fit_height(Bar *b)
     if (!b->ls) return;
     int want = bar_wanted_h(b);
     if (want == b->h) return;
-    ls_set_size(b->ls, (uint32_t)(cfg.min_width > 0 ? b->want_w : 0), (uint32_t)want);
+
+    /* Width 0 means "as wide as the output", which the protocol only allows
+     * when anchored to both sides. A floating bar is not, so it has to send a
+     * real width — and want_w is still zero until the width has been fitted
+     * once, which since it stopped fitting during animations is exactly when
+     * a fold would ask for a new height. */
+    uint32_t w = 0;
+    if (cfg.min_width > 0) {
+        w = (uint32_t)(b->want_w > 0 ? b->want_w : b->w);
+        if (!w) return;                          /* nothing sensible to ask */
+    }
+    ls_set_size(b->ls, w, (uint32_t)want);
     wl_surface_commit(b->surf);
 }
 
@@ -4001,6 +4238,9 @@ static void hover_cal_build(Cell *e)
 
     struct tm first = t;
     first.tm_mday = 1;
+    first.tm_mon += e->cal_off;                  /* the arrows move this */
+    while (first.tm_mon > 11) { first.tm_mon -= 12; first.tm_year++; }
+    while (first.tm_mon < 0)  { first.tm_mon += 12; first.tm_year--; }
     first.tm_hour = 12; first.tm_min = 0; first.tm_sec = 0;
     time_t ft = mktime(&first);
     localtime_r(&ft, &first);
@@ -4027,7 +4267,9 @@ static void hover_cal_build(Cell *e)
     for (int i = 0; i < lead; ++i, ++col)
         o += (size_t)snprintf(out + o, sizeof(out) - o, "   ");
     for (int d = 1; d <= days && o < sizeof(out) - 64; ++d) {
-        if (d == t.tm_mday)
+        bool is_today = d == t.tm_mday && first.tm_mon == t.tm_mon &&
+                        first.tm_year == t.tm_year;
+        if (is_today)
             o += (size_t)snprintf(out + o, sizeof(out) - o,
                                   "<span foreground=\"%s\">%2d</span>%s", hl, d,
                                   col == 6 ? "" : " ");
@@ -4056,7 +4298,38 @@ static void hover_cmd_run(Cell *e)
 
 static const char *bar_tip_text(Bar *b)
 {
+    /* A message says itself, for a few seconds, wherever the pointer is —
+     * folded there is nowhere else for the words to go. */
+    if (msg_active() && cfg.msg_panel > 0 && msg_at &&
+        (int32_t)(now_ms() - msg_at) < cfg.msg_panel * 1000) {
+        b->tip_msg  = true;
+        b->tip_cell = -1;
+        b->tip_cx   = (float)b->w * 0.5f;
+        return msg_text;
+    }
+    b->tip_msg = false;
+
     if (!b->hovered) return NULL;
+
+    /* A cell set to open on a click stays open until it is clicked again or
+     * something else is, so you can read it without holding the pointer
+     * still — and pointing at it does nothing. */
+    if (b->tip_pinned >= 0 && b->tip_pinned < cfg.cell_count) {
+        Cell *e = &cfg.cell[b->tip_pinned];
+        if (e->out_hover[0]) {
+            b->tip_cell = b->tip_pinned;
+            /* where to hang it from. Without this the panel kept whatever
+             * position it had — for a click-opened one, none at all, so it
+             * went to the far left instead of under its cell. */
+            for (int i = 0; i < b->chits; ++i)
+                if (b->chit[i].cell == b->tip_pinned) {
+                    b->tip_cx = (b->chit[i].x0 + b->chit[i].x1) * 0.5f;
+                    break;
+                }
+            return e->out_hover;
+        }
+        b->tip_pinned = -1;
+    }
 
     /* The panel is part of the bar's surface, so the pointer can be on it
      * rather than on the cell — keep it open while it is. */
@@ -4066,6 +4339,11 @@ static const char *bar_tip_text(Bar *b)
         double t1 = top ? (double)b->h : (double)b->tip_h;
         if (b->py >= t0 && b->py < t1) {
             b->tip_cell = b->tip_showing;
+            for (int i = 0; i < b->chits; ++i)
+                if (b->chit[i].cell == b->tip_cell) {
+                    b->tip_cx = (b->chit[i].x0 + b->chit[i].x1) * 0.5f;
+                    break;
+                }
             return cfg.cell[b->tip_cell].out_hover;
         }
     }
@@ -4076,9 +4354,10 @@ static const char *bar_tip_text(Bar *b)
     for (int i = 0; i < b->chits; ++i) {
         if (b->px < b->chit[i].x0 - slack || b->px >= b->chit[i].x1 + slack) continue;
         Cell *e = &cfg.cell[b->chit[i].cell];
+        if (e->hover_click) return NULL;               /* it waits for a click */
         if (!e->out_hover[0] && !*e->hover_cmd && !e->hover_cal) return NULL;
         if (b->tip_showing != b->chit[i].cell) {
-            if (e->hover_cal)        hover_cal_build(e);
+            if (e->hover_cal)        { e->cal_off = 0; hover_cal_build(e); }
             else if (*e->hover_cmd)  hover_cmd_run(e);
         }
         if (!e->out_hover[0]) return NULL;
@@ -4092,15 +4371,30 @@ static const char *bar_tip_text(Bar *b)
     return NULL;
 }
 
+/* Ask the compositor for a new size — sparingly.
+ *
+ * Every one of these is a round trip: set_size, a configure back, a fresh
+ * pool of buffers, a transaction in the compositor. A bar whose content width
+ * wobbles by a pixel — a gauge counting up, a cell scrolling — could ask
+ * sixty times a second for hours, and nothing on this side would look wrong
+ * while the compositor did all the work. So: not while anything is moving,
+ * not more than four times a second, and not for differences too small to
+ * see. */
 static void bar_fit_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
 {
     if (cfg.min_width <= 0 || !b->ls) return;
+    if (scroll_running || b->vis != b->anim_to) return;
+
+    uint32_t now = now_ms();
+    if (b->last_fit && (int32_t)(now - b->last_fit) < 250) return;
+
     int want = bar_natural_width(b, cv, f, vis, s);
-    if (want != b->want_w && abs(want - b->w) >= 2) {
-        b->want_w = want;
-        ls_set_size(b->ls, (uint32_t)want, (uint32_t)b->h);
-        wl_surface_commit(b->surf);
-    }
+    if (want == b->want_w || abs(want - b->w) < 4) return;
+
+    b->want_w  = want;
+    b->last_fit = now;
+    ls_set_size(b->ls, (uint32_t)want, (uint32_t)b->h);
+    wl_surface_commit(b->surf);
 }
 
 /* Everything the bar paints, into a plain canvas. Split out of bar_render so
@@ -4109,8 +4403,9 @@ static void bar_fit_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
 static void bar_paint_tip(Bar *b, Canvas *cv, Font *f, float s, bool top,
                           float bar_y0, float bar_vis)
 {
-    const char *txt = b->tip_cell >= 0 && b->tip_cell < cfg.cell_count
-                    ? cfg.cell[b->tip_cell].out_hover : NULL;
+    const char *txt = b->tip_msg ? msg_text
+                    : (b->tip_cell >= 0 && b->tip_cell < cfg.cell_count
+                       ? cfg.cell[b->tip_cell].out_hover : NULL);
     if (!txt || !*txt || b->tip_h <= 0) return;
 
     float th = (float)b->tip_h * s;
@@ -4138,26 +4433,34 @@ static void bar_paint_tip(Bar *b, Canvas *cv, Font *f, float s, bool top,
 
     Runs rs[24];
     int saved = cfg.markup;
-    cfg.markup = cfg.cell[b->tip_cell].markup;
+    cfg.markup = b->tip_msg ? 1 : cfg.cell[b->tip_cell].markup;
+    Col tipcol = b->tip_msg ? msg_color() : cell_color(&cfg.cell[b->tip_cell]);
     float tw = 0;
     for (int i = 0; i < nlines; ++i) {
-        markup_parse(line[i], &rs[i], cell_color(&cfg.cell[b->tip_cell]));
+        markup_parse(line[i], &rs[i], tipcol);
         float lw = 0;
         for (int j = 0; j < rs[i].n; ++j) lw += text_width(f, rs[i].v[j].text);
         if (lw > tw) tw = lw;
     }
     cfg.markup = saved;
 
-    float pad = 8.0f * s;
+    /* the same breathing room a cell gives its text, so the panel does not
+       look tighter than the thing it dropped out of */
+    float pad = (float)(b->tip_msg ? 8 : cfg.cell[b->tip_cell].pad) * s;
+    if (pad < 10.0f * s) pad = 10.0f * s;
+
     float pw  = tw + 2.0f * pad;
     float rad = clampf(cfg.radius * s, 0.0f, th * 0.5f);
 
-    /* Clear of the bar's rounded corners at either end, so the panel never
-       overlaps the curve. */
-    float edge = rad + 4.0f * s;
-    float bx = clampf(b->tip_cx * s - pw * 0.5f,
-                      edge, (float)cv->w - pw - edge);
+    float bx = clampf(b->tip_cx * s - pw * 0.5f, 0.0f, (float)cv->w - pw);
     if (bx < 0.0f) bx = 0.0f;
+
+    /* Hard against an end of the bar: line the panel up with it and square
+       the corners that meet, so the outer edge is one straight line. */
+    b->tip_edge = 0;
+    float snap = rad + 6.0f * s;
+    if (bx <= snap)                     { bx = 0.0f;              b->tip_edge = -1; }
+    else if (bx + pw >= cv->w - snap)   { bx = (float)cv->w - pw;  b->tip_edge = +1; }
 
     /* Slide out and fade in: it should arrive rather than appear. */
     float k = cfg.anim_ms > 0
@@ -4167,21 +4470,49 @@ static void bar_paint_tip(Bar *b, Canvas *cv, Font *f, float s, bool top,
     float slide = (1.0f - e) * th * 0.45f;
     ty += top ? -slide : slide;
 
+    /* Only the edge where the two meet is square. The far corners stay
+       rounded: it is the bar that gives up its corner to the panel, not the
+       other way round. */
     if (top) fill_round(cv, bx, ty, pw, th, 0, 0, rad, rad,
                         col_scale_alpha(cfg.bg, e));
     else     fill_round(cv, bx, ty, pw, th, rad, rad, 0, 0,
                         col_scale_alpha(cfg.bg, e));
 
+    bool cal = !b->tip_msg && cfg.cell[b->tip_cell].hover_cal != 0;
     float row = (th - 8.0f * s) / (float)(nlines > 0 ? nlines : 1);
     for (int i = 0; i < nlines; ++i) {
         float ly = ty + 4.0f * s + (float)i * row;
         float base = baseline_for(f, ly, row, s);
         float x = bx + pad;
+        if (cal && i == 0) {                     /* the month sits centred
+                                                    between the two arrows */
+            float lw = 0;
+            for (int j = 0; j < rs[i].n; ++j) lw += text_width(f, rs[i].v[j].text);
+            x = bx + (pw - lw) * 0.5f;
+        }
         for (int j = 0; j < rs[i].n; ++j) {
             Col tc = rs[i].v[j].has_fg ? rs[i].v[j].fg : cfg.text;
             text_draw(cv, f, x, base, col_scale_alpha(tc, e), rs[i].v[j].text);
             x += text_width(f, rs[i].v[j].text);
         }
+    }
+
+    /* ‹ › on the title row, so the month can be paged. Their boxes are kept
+       in logical pixels for the click handler. */
+    b->cal_x0 = b->cal_x1 = b->cal_x2 = b->cal_x3 = 0;
+    if (cal && nlines > 0) {
+        const char *L = "\xe2\x80\xb9", *R = "\xe2\x80\xba";   /* ‹ › */
+        float aw = text_width(f, L), ar = text_width(f, R);
+        float base = baseline_for(f, ty + 4.0f * s, row, s);
+        Col ac = col_scale_alpha(cfg.accent, e);
+        float lx = bx + pad, rx2 = bx + pw - pad - ar;
+        text_draw(cv, f, lx,  base, ac, L);
+        text_draw(cv, f, rx2, base, ac, R);
+        /* the whole end of the title row, padding included: a single glyph
+           is a small thing to hit */
+        b->cal_x0 = bx / s;                     b->cal_x1 = (lx + aw + pad) / s;
+        b->cal_x2 = (rx2 - pad) / s;            b->cal_x3 = (bx + pw) / s;
+        b->cal_y0 = ty / s;               b->cal_y1 = (ty + row + 8.0f * s) / s;
     }
 
     canvas_clip(cv, 0, (int)floorf(bar_y0), cv->w, (int)ceilf(bar_y0 + bar_vis));
@@ -4221,9 +4552,17 @@ static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
     memset(cv->px, 0, (size_t)cv->w * (size_t)cv->h * 4);
     canvas_clip_all(cv);
 
-    /* flush with the screen edge: the two corners that touch it stay square */
-    if (top) fill_round(cv, 0, y0, bw, vis, 0, 0, rad, rad, cfg.bg);
-    else     fill_round(cv, 0, y0, bw, vis, rad, rad, 0, 0, cfg.bg);
+    /* Flush with the screen edge: the two corners that touch it stay square.
+     * A panel hanging off one end squares that corner too, so the edge runs
+     * straight from the bar into the panel instead of pinching in and out
+     * again around two facing curves. */
+    float br_l = rad, br_r = rad;
+    if (b->tip_h > 0 && b->tip_edge) {
+        if (b->tip_edge < 0) br_l = 0.0f; else br_r = 0.0f;
+    }
+    if (top) fill_round(cv, 0, y0, bw, vis, 0, 0, br_r, br_l, cfg.bg);
+    else     fill_round(cv, 0, y0, bw, vis, br_l, br_r, 0, 0, cfg.bg);
+
 
     Runs rs;
     markup_parse(status_line, &rs, cfg.text);
@@ -4320,13 +4659,18 @@ static void bar_render(Bar *b)
 
     /* only the visible strip takes clicks — the rest of the surface is
      * transparent and must not swallow them */
-    struct wl_region *reg = wl_compositor_create_region(compositor);
     /* the bar, plus the panel while one is open: the pointer has to be able
-     * to rest on the panel without the hover ending under it */
+     * to rest on the panel without the hover ending under it. Sent only when
+     * it changes — the compositor allocates a region for every one of these. */
     int rv = (int)ceilf(visL) + (b->tip_h > 0 ? b->tip_h : 0);
-    wl_region_add(reg, 0, top ? 0 : b->h - rv, b->w, rv);
-    wl_surface_set_input_region(b->surf, reg);
-    wl_region_destroy(reg);
+    int ry = top ? 0 : b->h - rv;
+    if (rv != b->reg_h || ry != b->reg_y || b->w != b->reg_w) {
+        struct wl_region *reg = wl_compositor_create_region(compositor);
+        wl_region_add(reg, 0, ry, b->w, rv);
+        wl_surface_set_input_region(b->surf, reg);
+        wl_region_destroy(reg);
+        b->reg_h = rv; b->reg_y = ry; b->reg_w = b->w;
+    }
 
     if (cfg.exclusive)                       /* the panel must not reserve
                                                 space: it is transient */
@@ -4352,6 +4696,7 @@ static bool bar_animating(Bar *b)
     if (b->vis != b->anim_to) return true;
     if (b->tip_showing >= 0 && cfg.anim_ms > 0 &&
         (int32_t)(now_ms() - b->tip_at) < cfg.anim_ms) return true;   /* sliding */
+    if (msg_active() && cfg.msg_flash) return true;                   /* pulsing */
     return false;
 }
 
@@ -4409,6 +4754,7 @@ static void bar_create(Output *o)
     b->scale = o->scale > 0 ? o->scale : 1;
     b->w = 0;
     b->h = bar_wanted_h(b);
+    b->tip_pinned = -1;
     b->vis = cfg.start_collapsed ? 0.0f : 1.0f;
     b->anim_to = b->vis;
     b->collapsed = cfg.start_collapsed != 0;
@@ -4509,6 +4855,46 @@ static const struct wl_output_listener output_listener = {
 
 /* --------------------------------------------------------------- pointer */
 
+/* What the pointer should look like where it is. Everything in the bar does
+ * something when clicked, so it is a hand over a workspace, a cell or a
+ * calendar arrow, and the ordinary arrow over the gaps. */
+static struct wp_cursor_shape_manager_v1 *cursor_mgr;
+static struct wp_cursor_shape_device_v1  *cursor_dev;
+static uint32_t cursor_serial, cursor_now;
+
+static void cursor_set(uint32_t shape)
+{
+    if (!cursor_dev || !cursor_serial || shape == cursor_now) return;
+    wp_cursor_shape_device_v1_set_shape(cursor_dev, cursor_serial, shape);
+    cursor_now = shape;
+}
+
+static bool bar_point_is_clickable(Bar *b)
+{
+    if (!b) return false;
+    for (int i = 0; i < b->hits; ++i)                    /* a workspace */
+        if (b->px >= b->hit[i].x0 && b->px < b->hit[i].x1) return true;
+
+    if (b->tip_showing >= 0 && b->cal_x1 > b->cal_x0 &&  /* a calendar arrow */
+        b->py >= b->cal_y0 && b->py < b->cal_y1 &&
+        ((b->px >= b->cal_x0 && b->px < b->cal_x1) ||
+         (b->px >= b->cal_x2 && b->px < b->cal_x3))) return true;
+
+    for (int i = 0; i < b->chits; ++i) {                 /* a cell with a bind */
+        if (b->px < b->chit[i].x0 || b->px >= b->chit[i].x1) continue;
+        Cell *e = &cfg.cell[b->chit[i].cell];
+        for (int n = 1; n < MAX_BINDS; ++n) if (*e->bind[n]) return true;
+        return false;
+    }
+    return false;
+}
+
+static void cursor_update(Bar *b)
+{
+    cursor_set(bar_point_is_clickable(b) ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER
+                                         : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+}
+
 static Bar *bar_of_surface(struct wl_surface *s)
 {
     for (int i = 0; i < output_count; ++i)
@@ -4519,13 +4905,22 @@ static Bar *bar_of_surface(struct wl_surface *s)
 static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
                       struct wl_surface *surf, wl_fixed_t sx, wl_fixed_t sy)
 {
-    (void)d; (void)p; (void)serial;
+    (void)d; (void)p;
     Bar *b = bar_of_surface(surf);
     pointer_bar = b;
     if (!b) return;
     b->hovered = true;
     b->px = wl_fixed_to_double(sx);
     b->py = wl_fixed_to_double(sy);
+
+    /* set_shape needs the serial of an enter, and the shape has to be set
+     * again for every one of them or the compositor keeps the last cursor */
+    cursor_serial = serial;
+    cursor_now = 0;
+    if (cursor_mgr && !cursor_dev && pointer)
+        cursor_dev = wp_cursor_shape_manager_v1_get_pointer(cursor_mgr, pointer);
+    cursor_update(b);
+
     bar_set_grab(b, true);
 }
 
@@ -4535,6 +4930,7 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial, struct wl_
     Bar *b = bar_of_surface(surf);
     if (!b) return;
     b->hovered = false;
+    b->tip_pinned = -1;
     b->dirty = true;
     if (b->hover_open) { b->hover_open = false; bar_set_collapsed(b, true); }
     bar_set_grab(b, false);
@@ -4569,6 +4965,7 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t sx,
     pointer_bar->py = wl_fixed_to_double(sy);
     pointer_bar->dirty = true;
     hover_slim_check(pointer_bar);
+    cursor_update(pointer_bar);
 }
 
 static void ws_switch(const char *name)
@@ -4583,8 +4980,50 @@ static void ws_switch(const char *name)
     sway_cmd("workspace --no-auto-back-and-forth \"%s\"", esc);
 }
 
+/* the calendar arrows, if that is what was clicked */
+static bool cal_click(Bar *b, int button)
+{
+    if (button != 1 || b->tip_showing < 0 || b->cal_x1 <= b->cal_x0) return false;
+    if (b->py < b->cal_y0 || b->py >= b->cal_y1) return false;
+
+    Cell *e = &cfg.cell[b->tip_showing];
+    if (!e->hover_cal) return false;
+
+    if (b->px >= b->cal_x0 && b->px < b->cal_x1)      e->cal_off--;
+    else if (b->px >= b->cal_x2 && b->px < b->cal_x3) e->cal_off++;
+    else return false;
+
+    if (e->cal_off < -600) e->cal_off = -600;      /* fifty years either way */
+    if (e->cal_off >  600) e->cal_off =  600;
+    hover_cal_build(e);
+    b->dirty = true;
+    return true;
+}
+
 static void bar_click(Bar *b, int button)
 {
+    if (cal_click(b, button)) return;
+
+    /* opening and closing a click-panel, before anything else the click
+     * might have meant */
+    if (button == 1) {
+        int on = -1;
+        for (int i = 0; i < b->chits; ++i)
+            if (b->px >= b->chit[i].x0 && b->px < b->chit[i].x1) { on = b->chit[i].cell; break; }
+
+        if (on >= 0 && cfg.cell[on].hover_click) {
+            Cell *e = &cfg.cell[on];
+            if (b->tip_pinned == on) b->tip_pinned = -1;   /* clicked again */
+            else {
+                if (e->hover_cal)       { e->cal_off = 0; hover_cal_build(e); }
+                else if (*e->hover_cmd) hover_cmd_run(e);
+                b->tip_pinned = e->out_hover[0] ? on : -1;
+            }
+            b->dirty = true;
+            return;
+        }
+        if (b->tip_pinned >= 0) { b->tip_pinned = -1; b->dirty = true; }
+    }
     for (int i = 0; i < b->chits; ++i)
         if (b->px >= b->chit[i].x0 && b->px < b->chit[i].x1) {
             Cell *e = &cfg.cell[b->chit[i].cell];
@@ -4743,6 +5182,9 @@ static void reg_global(void *d, struct wl_registry *r, uint32_t id,
             seat = (struct wl_seat *)wl_registry_bind(r, id, &wl_seat_interface, vmin(ver, 5));
             wl_seat_add_listener(seat, &seat_listener, NULL);
         }
+    } else if (!strcmp(iface, wp_cursor_shape_manager_v1_interface.name)) {
+        cursor_mgr = (struct wp_cursor_shape_manager_v1 *)
+            wl_registry_bind(r, id, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (!strcmp(iface, zwlr_layer_shell_v1_interface.name)) {
         layer_shell = (struct zwlr_layer_shell_v1 *)
             wl_registry_bind(r, id, &zwlr_layer_shell_v1_interface, vmin(ver, 4));
@@ -4895,6 +5337,12 @@ static void usage(void)
 "                      placeholders as src_fmt, or %s for a command cell's\n"
 "                      output. The cell is measured with it, so it grows to\n"
 "                      fit rather than truncating\n"
+"  NAME.hover_click=0  1 = the panel opens on a click and stays until you\n"
+"                      click again, instead of following the pointer\n"
+"  NAME.alert=30,20,10,5   percentages that fire once on the way down and\n"
+"                      rearm on the way up. alert_msg= the text, alert_cmd=\n"
+"                      a command (%c is the percentage), alert_tone= Hz,\n"
+"                      alert_ms=, alert_beeps=, alert_play= the player\n"
 "  NAME.hover_slim=0   1 = folded, resting on this cell opens the bar for as\n"
 "                      long as you stay on it\n"
 "  NAME.slim_color2=   second colour: the minutes of a clock cell, and its\n"
@@ -4916,7 +5364,8 @@ static void usage(void)
 "  msg_fifo=           default $XDG_RUNTIME_DIR/swbr.fifo\n"
 "  msg_target=         name of the cell a message takes over while it lasts\n"
 "  msg_timeout=8       seconds, 0 = until cleared. Click it to dismiss\n"
-"  msg_flash=1         paint the whole folded strip in the message colour\n"
+"  msg_flash=1         pulse the folded strip in the message colour\n"
+"  msg_panel=3         seconds the message also drops into the panel\n"
 "  msg_info= msg_warn= msg_error=\n"
 "\n"
 "folding\n"

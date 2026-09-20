@@ -1,5 +1,6 @@
-PREFIX  ?= $(HOME)
+PREFIX  ?= /usr
 BINDIR  ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share/swbr
 CONFDIR ?= $(HOME)/.config/swbr
 
 CC      ?= cc
@@ -26,17 +27,32 @@ debug: swbr.c stb_truetype.h
 		-DSWBR_BUILD='"$(BUILD)-dbg"' -o swbr-debug swbr.c $(LDFLAGS) $(LDLIBS)
 
 install: swbr
-	install -d $(BINDIR)
-	install -m755 swbr $(BINDIR)/swbr
+	install -Dm755 swbr $(DESTDIR)$(BINDIR)/swbr
+	install -Dm644 config.example $(DESTDIR)$(DATADIR)/config.example
+	install -Dm644 config.advanced.example $(DESTDIR)$(DATADIR)/config.advanced.example
+	@echo "installed $(DESTDIR)$(BINDIR)/swbr"
+	@echo "examples  $(DESTDIR)$(DATADIR)/"
 
+# Your own copy: edit it freely, an install never touches it.
 config:
 	install -d $(CONFDIR)
 	[ -f $(CONFDIR)/config ] || install -m644 config.example $(CONFDIR)/config
 
+# The shipped example, live: every install updates what you are running.
+# Link the advanced one with  make link EXAMPLE=config.advanced.example
+EXAMPLE ?= config.example
+link:
+	install -d $(CONFDIR)
+	ln -sfn $(DATADIR)/$(EXAMPLE) $(CONFDIR)/config
+	@echo "$(CONFDIR)/config -> $(DATADIR)/$(EXAMPLE)"
+
 uninstall:
-	rm -f $(BINDIR)/swbr
+	rm -f $(DESTDIR)$(BINDIR)/swbr
+	rm -f $(DESTDIR)$(DATADIR)/config.example
+	rm -f $(DESTDIR)$(DATADIR)/config.advanced.example
+	-rmdir $(DESTDIR)$(DATADIR) 2>/dev/null || true
 
 clean:
 	rm -f swbr swbr-debug
 
-.PHONY: all debug install config uninstall clean
+.PHONY: all debug install config link uninstall clean

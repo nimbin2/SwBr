@@ -16,8 +16,9 @@ what is going on.
 ```sh
 sudo apt install build-essential libwayland-dev
 make
-make install          # ~/.local/bin, or PREFIX=/usr/local
+sudo make install     # /usr/bin, examples in /usr/share/swbr
 make config           # optional: config.example -> ~/.config/swbr/config
+make link             # or: config -> the installed example, kept in sync
 ```
 
 `libwayland-client` is the only library it links. The layer-shell protocol glue
@@ -110,11 +111,42 @@ already knows.
 
 `slim_align=1` (the default) gives each mark its cell's whole place, inset by
 the same padding the text had — so folding changes the height of the bar and nothing else.
-Starting folded, the open layout is worked out once with nothing drawn, so the
-marks are the right size from the first frame. `slim_align=0` packs them
+Every folded frame works the open layout out first with nothing drawn, so the
+marks are right from the first frame, `--slim` included. `slim_align=0` packs them
 against the right edge instead.
 
+`ws_slots=10` (the default) puts the numbers 1–10 in the bar whether or not
+they exist. A free number is the same button in the same place, `ws_empty_alpha`
+faint, and clicking it opens that workspace. `0` shows only open ones.
+
+Folded and lined up, the workspace marks are the open bar's own buttons — the
+same set, the same left edges, the same widths — so you click the same spot in
+either mode. Brightness says used from unused. `slim_ws_w` forces a width;
+`slim_ws_slots` only applies to the packed strip (`slim_align=0`).
+
+`slim_bar_segs=10` splits a folded gauge into ten blocks, so four lit blocks
+reads as forty percent. `slim_bar_gap` is the space between them,
+`slim_bar_pad` the space either side of the whole gauge, and `0` segments
+gives one solid bar. A cell too narrow to show the dividers halves the count;
+give it a `slim_w` instead — on a gauge that wins over the alignment and grows
+about the cell's middle, which is what a two-digit battery needs.
+
 `signals=0` leaves a plain strip.
+
+A floating bar (`min_width` > 0) sizes itself to its content. It grows at once,
+but ignores getting narrower by less than `shrink_px=24` and waits `shrink_s=30`
+before a bigger narrowing — it is centred, so every width change moves
+everything on it.
+
+## Redrawing
+
+`redraw_ms=250` holds cell updates and merges whatever lands in the same window
+into one frame — every frame is a round trip through the compositor, and ten
+cells on their own timers would otherwise wake the bar three times a second.
+
+Anything coming from sway is exempt. A workspace switch is drawn on the next
+frame, so switching back and forth stays visible instead of the two changes
+merging into one late frame.
 
 ## Hover
 
@@ -153,7 +185,9 @@ Monday, and `‹ ›` at either end of the title row page the month; it opens on
 the current one every time.
 
 `NAME.hover_cmd=` is the general form: any command's output, run once when the
-hover starts rather than on a timer. The panel is as tall as the output has
+hover starts rather than on a timer. It is wrapped in `timeout 2`, since it
+runs on the frame the pointer arrives and a command that blocks would block
+the whole bar. The panel is as tall as the output has
 lines either way.
 
 ```
@@ -220,9 +254,17 @@ ws_cpu=1  ws_cpu_interval=3  ws_cpu_idle=0.01  ws_cpu_min=0.25  ws_cpu_full=4
 ```
 
 The numbers go to `$XDG_RUNTIME_DIR/swbr-cpu` so swov can draw the same thing
-without measuring anything itself.
+without measuring anything itself. The last thirty-two windows to be focused
+go to `$XDG_RUNTIME_DIR/swbr-focus` in the same spirit: swov opens and closes
+in a moment and can never watch focus itself, so its `tab` key reads the order
+from here.
 
 ## Other monitors
+
+Workspaces are ordered by number, not in the order sway lists them — that is
+grouped by output, so with a second monitor the numbers come out interleaved
+and which way round depends on which cable went in first. `ws_sort=0` keeps
+sway's order.
 
 `ws_other=1` adds the workspaces from your other screens as short pills on the
 bar's bottom edge, in smaller, dimmer type. Folded they take a slot like any
@@ -269,11 +311,13 @@ panels, and a `poweroff` at one percent. Either goes to
 | `min_width`, `align_x`, `side_margin` | a floating bar sizes itself to its content |
 | `radius` | corner radius; the corners at the screen edge stay square |
 | `outputs`, `ws_other` | which monitors get a bar, and whose workspaces show |
-| `ws_names`, `ws_inset`, `ws_radius` | numbers or names, pills or blocks |
+| `ws_names`, `ws_inset`, `ws_radius`, `ws_border` | numbers or names, pills or blocks, outlined or not |
+| `ws_slots`, `ws_empty_alpha` | show every number, open or not, and how faint |
+| `slim_ws_w`, `slim_bar_segs`, `slim_bar_gap` | folded slot width, gauge blocks |
 | `font`, `font_alt`, `ui_scale`, `text_px` | text |
 | `markup` | the pango subset: `<span foreground=..>`, `<b>`, `&amp;` |
 | `hide_key`, `collapsed_px`, `anim_ms` | folding |
-| `signals`, `slim_align`, `slim_ws_slots` | what the folded strip shows |
+| `signals`, `slim_align`, `slim_ws_slots`, `slim_bar_segs` | what the folded strip shows |
 | `status_command` | i3bar-style status, used when no cells are configured |
 
 Colours and fonts for swbr, swov and swas can be set once in
@@ -282,9 +326,47 @@ Colours and fonts for swbr, swov and swas can be set once in
 the table. Keys before any section go to all three, a `[swbr]` section to swbr
 only. This config is read afterwards and wins, the command line wins over that.
 
+`make install` also drops the shipped examples in `/usr/share/swbr/`.
+`make link` points your config at one of them, so the next install is the
+config you are running — handy if you want to follow the examples rather than
+keep your own copy. Edits you make there are overwritten on install.
+
 ## Notes
 
-- Talks to the sway IPC socket directly: no `swaymsg`, no `jq`.
+- Talks to the sway IPC socket directly: no `swaymsg`, no `jq`. Every reply
+  costs the compositor about twelve times its own size and never gives it
+  back, so swbr asks as rarely as it can: a workspace switch is applied from
+  the event itself rather than by fetching the list again, and only a change
+  in the set of workspaces — one created, emptied, renamed — asks for a new
+  one. The tree is
+  the expensive question, so it is asked for only when sway has said
+  something changed, never more often than `tree_min_s` (5), and shared
+  between the load sampler and every `source=window` cell. Only the changes that
+  can move a window between workspaces count — new, close, move, floating —
+  so a shell retitling itself on every prompt does not. An idle session, or a
+  busy terminal, fetches it once at startup and then not again — polling it every couple of
+  seconds made sway grow by about six times each reply and never give it
+  back, which is a compositor bug but not one worth leaning on.
+- Cell updates are held for `redraw_ms` (250, or `refresh=` in seconds) and
+  merged into one frame. Ten
+  cells on their own timers wake the bar three times a second, each with one
+  number changed, and every frame is a full round trip through the
+  compositor; a clock a quarter of a second late is not a clock anyone
+  notices. Anything moving — an animation, a hover, a scrolling cell —
+  bypasses it.
+- A frame that comes out identical to the one on screen is never sent: the
+  new buffer is compared against the old and the commit skipped. Ten cells on
+  short timers wake the bar constantly, but the volume is usually still 80%.
+- Frames are capped at one per 8 ms per bar, so nothing upstream — an
+  animation, a configure, a cell whose width wobbles — can turn into an
+  unbounded stream of requests. `SWBR_TRACE=1 swbr` prints, every five
+  seconds, how many commits, resizes, buffer pools, regions and configures
+  went to the compositor, and on a second line how many IPC queries went to
+  sway and how many kilobytes came back. `no_tree=1` stops swbr asking for the
+  tree at all, which switches off the load dots and every `source=window`
+  cell. `--minimal` goes further: workspaces only, no cells, no tree, no
+  keyboard grab, no fifo — a bare layer surface, for finding out which part
+  of swbr a compositor is unhappy about.
 - The cursor comes from `cursor-shape-v1`, so there is no cursor theme to
   load and no cursor surface to draw. On a compositor without it the pointer
   simply keeps whatever shape it had.

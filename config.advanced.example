@@ -24,6 +24,10 @@ min_width=800      # 0 = span the whole output. Otherwise the bar floats and
                    # sizes itself to its content: never narrower than this,
                    # never wider than the screen. Cells appearing (charging,
                    # docker) grow it instead of being cut off
+shrink_px=24       # it grows at once but ignores getting narrower by less than
+                   # this, so 99% -> 100% or a temperature losing a digit does
+                   # not move the whole (centred) bar
+shrink_s=30        # a bigger narrowing has to hold this long first
 align_x=center     # where the floating bar sits: center | left | right
 radius=10          # corner radius. The two corners that touch the screen edge
                    # stay square, so the bar sits flush against it
@@ -38,6 +42,14 @@ ws_inset=0         # gap above and below the buttons. 0 = the button spans
                    # the full bar height, top to bottom
 ws_radius=0        # 0 = square corners. -1 = follow radius, or a full pill
                    # when ws_inset > 0
+ws_border=0        # outline thickness in px around every button. 0 = none,
+                   # which is the plain look: the gap between buttons is the
+                   # only division
+ws_slots=10        # always show the numbers 1..10, open or not. A free number
+                   # is the same button in the same place, just faint, and
+                   # clicking one opens that workspace. It also means the bar
+                   # is the same width folded and open. 0 = only what is open
+ws_empty_alpha=35  # how visible a free number is, percent
 ws_click=1
 scroll_workspace=0
 mode_show=1        # show the binding mode (resize, ..)
@@ -108,6 +120,14 @@ separator_color=3a4654ff
 # While a message is up it takes over the cmus cell, so the title turns into
 # the warning and turns back into the title afterwards. Click it to dismiss.
 msg_target=cmus
+redraw_ms=250      # or refresh=0.25, the same thing in seconds. Try 1000 if
+                   # you would rather the bar redrew once a second.
+                   # Cell updates are held this long and merged into one
+                   # frame. Every frame is a round trip through the
+                   # compositor, and ten cells on their own timers otherwise
+                   # wake the bar three times a second. Anything from sway --
+                   # a workspace switch, urgency -- skips the hold and is
+                   # drawn on the next frame
 msg_timeout=8      # seconds; 0 = stays until cleared
 msg_flash=1        # folded bar turns fully into the message colour
 msg_info=89afc4
@@ -164,6 +184,9 @@ volume.cmd=alsa_control volume get
 volume.interval=2
 volume.button2=alsa_control mute toggle
 volume.slim=bar
+volume.slim_w=56   # folded: a gauge needs room for its ten blocks, and this
+                   # cell is only two characters wide. Wins over slim_align,
+                   # growing about the middle so it stays where the text was
 volume.slim_color=a9d8f5   # light baby blue, its own thing on the strip
 
 # --- docker and mpv share one group: docker.sep=0 joins them ---------------
@@ -259,6 +282,7 @@ battery.color=e1eeff
 battery.warn=<30:cecb00
 battery.crit=<12:ff2222
 battery.slim=bar
+battery.slim_w=56  # same again: wide enough to count the blocks
 
 # --- shouting when it is going flat -----------------------------------------
 battery.alert=30,20,10,5   # percentages. Each fires once on the way down and
@@ -292,7 +316,19 @@ signals=1          # the folded strip still says something: every workspace
                    # keeps a fixed slot on the left (slot 3 is always
                    # workspace 3), the clock becomes twelve dots, and cells
                    # with a percentage become little gauges
-slim_ws_slots=10   # at most this many workspace slots
+slim_ws_slots=10   # only for slim_align=0, the packed strip: this many
+                   # slots. Lined up, the strip is exactly the open bar's own
+                   # buttons — same set, same place, same width — so set
+                   # ws_slots above to choose how many
+slim_bar_segs=10   # folded gauges are split into this many blocks, so four
+                   # lit blocks reads as forty percent without measuring it.
+                   # 0 = one solid bar. Halves itself in a cell too narrow to
+                   # show the dividers — give that cell a slim_w instead
+slim_bar_gap=2     # px between those blocks
+slim_bar_pad=3     # px either side of a folded gauge. A gauge takes its
+                   # whole cell, so without this it runs edge to edge
+slim_ws_w=0        # folded slot width in px. 0 = each slot copies its own
+                   # button in the open bar, so nothing moves or resizes
 start_collapsed=0  # 1 = start folded. Command line: swbr --slim
 # Without the mouse. Bind either one to a key in your sway config:
 #   bindsym $mod+b exec swbr --toggle      (also --fold / --unfold)
@@ -325,6 +361,8 @@ dim=5a6b7aff
 accent=89afc4ff     # visible-but-not-focused workspace tick
 hl=cb9b00ff         # focused workspace tick in the folded strip
 urgent=e0533cff
+ws_sort=1          # order them by number. sway lists them grouped by output,
+                   # so two monitors otherwise give 1 2 5 8 3 10
 ws_other=1         # 1 = also show the workspaces of your other monitors, as
                    # short pills on the baseline so they are clearly not this
                    # screen's
@@ -332,6 +370,9 @@ ws_cpu=1           # a dot on each workspace button showing how much
                    # processor time the windows on it are using. Folded, the
                    # workspace slot fills from the bottom instead
 ws_cpu_interval=3  # seconds between samples
+# tree_min_s=5     # the load dots and source=window cells need sway's tree.
+                   # It is fetched only when sway reports a change, and never
+                   # more often than this. no_tree=1 stops asking entirely
 ws_cpu_idle=0.01   # in cores. Under this a workspace counts as doing
                    # nothing and stays blank. Above it, but under ws_cpu_min,
                    # one faint dot: a player, a polling script, something

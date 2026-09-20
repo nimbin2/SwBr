@@ -670,10 +670,82 @@ static char *sway_request(uint32_t type, const char *payload)
     return body;
 }
 
+/* Everything swbr asks the compositor to do, counted. Sway allocates for
+ * each of these, so if its heap is growing while swbr runs, the answer is in
+ * these numbers. SWBR_TRACE=1 prints them every five seconds. */
+static struct {
+    unsigned commit, resize, pool, region, ack;
+    unsigned ipc_tree, ipc_ws, ipc_other;
+    unsigned long ipc_bytes;
+} wl_count;
+static bool wl_trace;
+
+static void wl_trace_tick(void)
+{
+    if (!wl_trace) return;
+    static uint32_t next;
+    uint32_t now = now_ms();
+    if (next && (int32_t)(now - next) < 0) return;
+    next = now + 5000;
+    fprintf(stderr, "swbr: per 5s — commits %u, resizes %u, pools %u, "
+                    "regions %u, configures %u\n"
+                    "swbr:           ipc: %u tree, %u workspaces, %u other, "
+                    "%lu KiB back\n",
+            wl_count.commit, wl_count.resize, wl_count.pool,
+            wl_count.region, wl_count.ack,
+            wl_count.ipc_tree, wl_count.ipc_ws, wl_count.ipc_other,
+            wl_count.ipc_bytes / 1024);
+    memset(&wl_count, 0, sizeof(wl_count));
+}
+
+static JV *sway_query(uint32_t type);
+
+/* The whole tree is the most expensive thing swbr asks sway for — it builds
+ * and serialises the lot every time. The cpu sampler wants it, and so does
+ * every window cell, so they share one for a couple of seconds rather than
+ * each asking. Fewer, larger allocations on the compositor's side, and less
+ * of swbr's own time spent parsing the same JSON twice. */
+static int      no_tree_flag;      /* mirrors cfg.no_tree, set once config
+                                     parsing is done                       */
+static int      tree_min_ms = 5000;   /* never more often than this */
+static JV      *tree_cache;
+static uint32_t tree_cache_at;
+
+/* Polling this every couple of seconds made sway grow by roughly six times
+ * the size of each reply and never give it back — a compositor bug, but one
+ * swbr was leaning on twenty thousand times a night. It is asked for only
+ * when sway has said something changed, and never more often than
+ * tree_min_s. An idle session fetches it once, at startup, and then not
+ * again. */
+static bool     tree_dirty = true;
+
+static const JV *sway_tree_cached(void)
+{
+    if (no_tree_flag) return NULL;     /* for finding out whether it is us */
+
+    uint32_t now = now_ms();
+    if (tree_cache && !tree_dirty) return tree_cache;
+    if (tree_cache && (int32_t)(now - tree_cache_at) < tree_min_ms) return tree_cache;
+
+    jfree(tree_cache);
+    tree_cache = sway_query(IPC_GET_TREE);
+    tree_cache_at = now;
+    tree_dirty = false;
+    return tree_cache;
+}
+
+static void sway_tree_forget(void) { tree_dirty = true; }
+
 static JV *sway_query(uint32_t type)
 {
     char *body = sway_request(type, NULL);
     if (!body) return NULL;
+
+    if (type == IPC_GET_TREE)            wl_count.ipc_tree++;
+    else if (type == IPC_GET_WORKSPACES) wl_count.ipc_ws++;
+    else                                 wl_count.ipc_other++;
+    wl_count.ipc_bytes += strlen(body);
+
     JV *v = jparse(body);
     free(body);
     return v;
@@ -713,7 +785,7 @@ static bool sway_subscribe_events(void)
     sway_evt_fd = sway_connect();
     if (sway_evt_fd < 0) return false;
 
-    const char *payload = "[\"workspace\",\"mode\"]";
+    const char *payload = "[\"workspace\",\"mode\",\"window\"]";
     char hdr[14];
     memcpy(hdr, "i3-ipc", 6);
     uint32_t l = (uint32_t)strlen(payload), t = IPC_SUBSCRIBE;
@@ -746,6 +818,41 @@ static bool sway_subscribe_events(void)
  * name is picked out of "mode" events on the way past. */
 static char sway_mode[128] = "default";
 
+static bool ws_stale;            /* an event changed the set, not just the focus */
+static bool ws_apply_event(const JV *cur);
+
+/* The focus order, most recent first, left where swov can find it. Small
+ * enough that writing it on every focus change costs nothing worth counting;
+ * it is one line per window and never more than a few dozen. */
+#define FOCUS_MAX 32
+static int focus_ring[FOCUS_MAX];
+static int focus_n;
+
+static void focus_seen(int con_id)
+{
+    for (int i = 0; i < focus_n; ++i)             /* already known: move up */
+        if (focus_ring[i] == con_id) {
+            memmove(focus_ring + 1, focus_ring, (size_t)i * sizeof(int));
+            focus_ring[0] = con_id;
+            goto write;
+        }
+    if (focus_n < FOCUS_MAX) focus_n++;
+    memmove(focus_ring + 1, focus_ring, (size_t)(focus_n - 1) * sizeof(int));
+    focus_ring[0] = con_id;
+
+write:;
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt || !*rt) return;
+    char path[512], tmp[540];
+    snprintf(path, sizeof(path), "%s/swbr-focus", rt);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < focus_n; ++i) fprintf(f, "%d\n", focus_ring[i]);
+    fclose(f);
+    if (rename(tmp, path) != 0) unlink(tmp);
+}
+
 static bool sway_events_pending(void)
 {
     if (sway_evt_fd < 0) return false;
@@ -767,14 +874,59 @@ static bool sway_events_pending(void)
         if (rlen && !read_all(sway_evt_fd, body, rlen)) { free(body); break; }
         body[rlen] = 0;
 
-        /* 0x80000002 = mode, 0x80000000 = workspace */
+        /* 0x80000002 = mode, 0x80000000 = workspace, 0x80000003 = window */
         if (rtype == 0x80000002u) {
             JV *v = jparse(body);
             if (v) str_set(sway_mode, sizeof(sway_mode), jstr(v, "change", "default"));
             jfree(v);
         }
+
+        if (rtype == 0x80000000u) {                       /* workspace */
+            tree_dirty = true;
+            JV *v = jparse(body);
+            const char *ch = v ? jstr(v, "change", "") : "";
+            /* A switch only moves the highlight, so it can be applied from
+             * the event. Anything else changes the set of workspaces and
+             * needs a fresh list — and once one event in a batch has said
+             * so, a later focus must not talk us out of it. Switching to a
+             * brand new workspace arrives as init and then focus: believing
+             * the focus left the new workspace out of the list entirely and
+             * lit up whichever one happened to match. */
+            if (!(!strcmp(ch, "focus") || !strcmp(ch, "urgent")) ||
+                !ws_apply_event(jget(v, "current")))
+                ws_stale = true;
+            jfree(v);
+        }
+
+        if (rtype == 0x80000003u) {
+            /* Which window was last focused, and the one before that. swbr
+             * is the only thing here that watches all day, so it is the only
+             * thing that can know; swov reads the list to offer "the app you
+             * were just in". */
+            JV *fv = jparse(body);
+            if (fv && !strcmp(jstr(fv, "change", ""), "focus")) {
+                int id = jint(jget(fv, "container"), "id", 0);
+                if (id > 0) focus_seen(id);
+            }
+            jfree(fv);
+        }
+
+        if (rtype == 0x80000003u) {
+            /* Only the changes that move a window between workspaces matter
+             * here. A title change does not — and a terminal retitling
+             * itself on every prompt would otherwise keep asking sway for
+             * the tree, which is the thing worth not doing. */
+            JV *v = jparse(body);
+            const char *ch = v ? jstr(v, "change", "") : "";
+            if (!strcmp(ch, "new") || !strcmp(ch, "close") ||
+                !strcmp(ch, "move") || !strcmp(ch, "floating"))
+                tree_dirty = true;
+            jfree(v);
+        }
+
+        /* a window event on its own does not redraw the workspace buttons */
+        if (rtype != 0x80000003u) any = true;
         free(body);
-        any = true;
     }
     return any;
 }
@@ -791,6 +943,7 @@ typedef struct {
 
 static Ws  ws_list[MAX_WORKSPACES];
 static int ws_count = 0;
+static int ws_sort_flag = 1;    /* mirrors cfg.ws_sort, which is declared later */
 
 /* "3:web" -> "3" ; a name without a leading number keeps the name */
 static void ws_make_label(Ws *w, bool full_names)
@@ -806,6 +959,34 @@ static void ws_make_label(Ws *w, bool full_names)
     }
     if (w->num >= 0) snprintf(w->label, sizeof(w->label), "%d", w->num);
     else             str_set(w->label, sizeof(w->label), w->name);
+}
+
+/* Every IPC reply costs the compositor roughly twelve times its own size,
+ * and never gives it back. A workspace switch does not need a new list: the
+ * event says which one is current, and that is enough to move the focus and
+ * the visible flag about. Only a change in the set of workspaces — one
+ * created, emptied, renamed — needs asking again. */
+static bool ws_apply_event(const JV *cur)
+{
+    if (!cur || cur->type != J_OBJ || !ws_count) return false;
+
+    const char *name = jstr(cur, "name", "");
+    const char *out  = jstr(cur, "output", "");
+    if (!*name) return false;
+
+    int hit = -1;
+    for (int i = 0; i < ws_count; ++i)
+        if (!strcmp(ws_list[i].name, name)) { hit = i; break; }
+    if (hit < 0) return false;                   /* new to us: ask properly */
+
+    if (!*out) out = ws_list[hit].output;
+
+    for (int i = 0; i < ws_count; ++i) {
+        ws_list[i].focused = (i == hit);
+        if (!strcmp(ws_list[i].output, out)) ws_list[i].visible = (i == hit);
+    }
+    ws_list[hit].urgent = jbool(cur, "urgent", false);
+    return true;
 }
 
 static void ws_reload(bool full_names)
@@ -827,6 +1008,20 @@ static void ws_reload(bool full_names)
         ws_make_label(w, full_names);
     }
     jfree(r);
+
+    /* sway lists them by output, so with a second monitor the numbers come
+     * out interleaved — 1 2 5 on one, 3 4 on the other — and which order
+     * depends on which cable went in first. Sort by number, so 3 is always
+     * after 2 wherever it lives. */
+    if (ws_sort_flag)
+        for (int i = 1; i < ws_count; ++i)
+            for (int j = i; j > 0; --j) {
+                Ws *a = &ws_list[j - 1], *b = &ws_list[j];
+                bool swap = a->num > b->num ||
+                            (a->num == b->num && strcmp(a->name, b->name) > 0);
+                if (!swap) break;
+                Ws t = *a; *a = *b; *b = t;
+            }
 }
 
 /* ------------------------------------------------------ cpu per workspace
@@ -994,11 +1189,10 @@ static void cpu_write_cache(void)
 /* one sample; the first call only records, the ones after it measure */
 static void cpu_sample(void)
 {
-    JV *tree = sway_query(IPC_GET_TREE);
+    const JV *tree = sway_tree_cached();
     if (!tree) return;
     cpu_nwin = 0;
     cpu_collect_windows(tree, -1);
-    jfree(tree);
 
     DIR *d = opendir("/proc");
     if (!d) return;
@@ -1185,6 +1379,14 @@ typedef struct {
 
     /* workspaces */
     int  ws_names, ws_pad, ws_gap, ws_min_w, ws_click, scroll_workspace, ws_inset;
+    int  ws_border;              /* outline thickness in px, 0 = none        */
+    int  ws_slots;               /* show this many numbers, used or not      */
+    int  ws_empty_alpha;         /* how visible a free number is, percent    */
+    int  slim_bar_segs;          /* folded gauges: this many segments, 0 = solid */
+    int  slim_bar_gap;           /* px between those segments                */
+    int  slim_bar_pad;           /* px either side of a folded gauge         */
+    int  slim_ws_w;              /* folded slot width, 0 = the widest button */
+    int  shrink_px, shrink_s;    /* when a floating bar may get narrower    */
     float ws_radius;
     int  mode_show;
 
@@ -1202,6 +1404,8 @@ typedef struct {
     int  cell_count;
     char msg_fifo[PATH_MAX], msg_target[32];
     int  msg_timeout, msg_flash, msg_panel;
+    int  redraw_ms;              /* cell updates are held this long and
+                                    merged into one frame                 */
     Col  msg_info, msg_warn, msg_error;
     int  cell_gap, cell_inset, slim_ws_slots;
     float cell_radius;
@@ -1218,15 +1422,18 @@ typedef struct {
     /* colors */
     Col bg, text, dim, accent, hl, urgent, outline, running, slim_warm;
     int ws_other;                /* show other monitors' workspaces too  */
+    int ws_sort;                 /* by number, not in sway's output order */
     int slim_align;              /* folded marks sit under their full-bar
                                     positions, rather than packed right   */
+    int no_tree;                 /* never ask sway for the whole tree    */
+    int tree_min_s;              /* and never more often than this       */
     int ws_cpu;                  /* the load dot on a workspace button   */
     int ws_cpu_interval;         /* seconds between samples              */
     float ws_cpu_idle;           /* under this, nothing is happening at all */
     float ws_cpu_min, ws_cpu_full;  /* the scale, in cores                  */
     Col ws_bg, ws_fg, ws_focused_bg, ws_focused_fg;
     Col ws_visible_bg, ws_visible_fg, ws_urgent_bg, ws_urgent_fg;
-    Col mode_bg, mode_fg;
+    Col mode_bg, mode_fg, ws_border_col;
 } Config;
 
 static void config_defaults(Config *c)
@@ -1246,6 +1453,15 @@ static void config_defaults(Config *c)
     c->ws_pad = 11;
     c->ws_gap = 4;
     c->ws_inset = 0;
+    c->ws_border = 0;            /* off: the bar looked busier, not clearer */
+    c->ws_slots = 10;
+    c->ws_empty_alpha = 35;
+    c->slim_bar_segs = 10;
+    c->slim_bar_gap = 2;
+    c->slim_bar_pad = 3;
+    c->slim_ws_w = 0;
+    c->shrink_px = 24;
+    c->shrink_s = 30;
     c->ws_min_w = 0;
     c->ws_click = 1;
     c->scroll_workspace = 0;
@@ -1270,6 +1486,7 @@ static void config_defaults(Config *c)
     c->msg_timeout = 8;
     c->msg_flash = 1;
     c->msg_panel = 3;
+    c->redraw_ms = 250;
     c->msg_info  = (Col){ 0x89, 0xaf, 0xc4, 0xff };
     c->msg_warn  = (Col){ 0xcb, 0x9b, 0x00, 0xff };
     c->msg_error = (Col){ 0xe0, 0x53, 0x3c, 0xff };
@@ -1294,9 +1511,12 @@ static void config_defaults(Config *c)
     c->slim_warm     = (Col){ 0xe8, 0x96, 0x3c, 0xff };
     c->outline       = (Col){ 0x0a, 0x0e, 0x14, 0x99 };
     c->ws_bg         = (Col){ 0x1e, 0x27, 0x33, 0x00 };
+    c->ws_border_col = (Col){ 0x4a, 0x58, 0x6a, 0x9a };
     c->ws_fg         = (Col){ 0xb3, 0xc0, 0xcd, 0xff };
     c->ws_other        = 0;
+    c->ws_sort         = 1;
     c->slim_align      = 1;
+    c->tree_min_s      = 5;
     c->ws_cpu          = 1;
     c->ws_cpu_interval = 3;
     c->ws_cpu_idle     = 0.01f;   /* one percent of one core */
@@ -1497,6 +1717,12 @@ static void config_set(Config *c, const char *k, const char *v)
     if (!strcmp(k, "cell_gap")) { c->cell_gap = atoi(v); return; }
     if (!strcmp(k, "cell_inset")) { c->cell_inset = atoi(v); return; }
     if (!strcmp(k, "slim_ws_slots")) { c->slim_ws_slots = atoi(v); return; }
+    if (!strcmp(k, "slim_bar_segs")) { c->slim_bar_segs = atoi(v); return; }
+    if (!strcmp(k, "slim_bar_gap")) { c->slim_bar_gap = atoi(v); return; }
+    if (!strcmp(k, "slim_bar_pad")) { c->slim_bar_pad = atoi(v); return; }
+    if (!strcmp(k, "slim_ws_w")) { c->slim_ws_w = atoi(v); return; }
+    if (!strcmp(k, "shrink_px")) { c->shrink_px = atoi(v); return; }
+    if (!strcmp(k, "shrink_s")) { c->shrink_s = atoi(v); return; }
     if (!strcmp(k, "cell_radius")) { c->cell_radius = (float)atof(v); return; }
     if (!strcmp(k, "separator")) { str_set(c->separator, sizeof(c->separator), v); return; }
     if (!strcmp(k, "separator_color")) { parse_color(v, &c->separator_color); return; }
@@ -1517,6 +1743,9 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "ws_gap")) c->ws_gap = atoi(v);
     else if (!strcmp(k, "ws_min_w")) c->ws_min_w = atoi(v);
     else if (!strcmp(k, "ws_inset")) c->ws_inset = atoi(v);
+    else if (!strcmp(k, "ws_border")) c->ws_border = atoi(v);
+    else if (!strcmp(k, "ws_slots")) c->ws_slots = atoi(v);
+    else if (!strcmp(k, "ws_empty_alpha")) c->ws_empty_alpha = atoi(v);
     else if (!strcmp(k, "ws_click")) c->ws_click = atoi(v);
     else if (!strcmp(k, "ws_radius")) c->ws_radius = (float)atof(v);
     else if (!strcmp(k, "scroll_workspace")) c->scroll_workspace = atoi(v);
@@ -1542,6 +1771,8 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "msg_timeout")) c->msg_timeout = atoi(v);
     else if (!strcmp(k, "msg_flash")) c->msg_flash = atoi(v);
     else if (!strcmp(k, "msg_panel")) c->msg_panel = atoi(v);
+    else if (!strcmp(k, "redraw_ms")) c->redraw_ms = atoi(v);
+    else if (!strcmp(k, "refresh")) c->redraw_ms = (int)(atof(v) * 1000.0);
     else if (!strcmp(k, "msg_info")) parse_color(v, &c->msg_info);
     else if (!strcmp(k, "msg_warn")) parse_color(v, &c->msg_warn);
     else if (!strcmp(k, "msg_error")) parse_color(v, &c->msg_error);
@@ -1566,9 +1797,13 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "slim_warm")) parse_color(v, &c->slim_warm);
     else if (!strcmp(k, "outline")) parse_color(v, &c->outline);
     else if (!strcmp(k, "ws_bg")) parse_color(v, &c->ws_bg);
+    else if (!strcmp(k, "ws_border_col")) parse_color(v, &c->ws_border_col);
     else if (!strcmp(k, "ws_fg")) parse_color(v, &c->ws_fg);
     else if (!strcmp(k, "ws_other")) c->ws_other = atoi(v);
+    else if (!strcmp(k, "ws_sort")) c->ws_sort = atoi(v);
     else if (!strcmp(k, "slim_align")) c->slim_align = atoi(v);
+    else if (!strcmp(k, "no_tree")) c->no_tree = atoi(v);
+    else if (!strcmp(k, "tree_min_s")) c->tree_min_s = atoi(v);
     else if (!strcmp(k, "ws_cpu")) c->ws_cpu = atoi(v);
     else if (!strcmp(k, "ws_cpu_interval")) c->ws_cpu_interval = atoi(v);
     else if (!strcmp(k, "ws_cpu_idle")) c->ws_cpu_idle = (float)atof(v);
@@ -1954,6 +2189,36 @@ static void fill_round(Canvas *cv, float x, float y, float w, float h,
             float mx = fmaxf(qx, 0.0f), my = fmaxf(qy, 0.0f);
             float d = sqrtf(mx * mx + my * my) + fminf(fmaxf(qx, qy), 0.0f) - r;
             float cov = clampf(0.5f - d, 0.0f, 1.0f);
+            if (cov > 0) blend(cv, xx, yy, c, cov);
+        }
+    }
+}
+
+/* The same distance field kept to a ring: an outline that follows the corner
+ * radius and stays inside the box, so a button with no fill still has an edge. */
+static void stroke_round(Canvas *cv, float x, float y, float w, float h,
+                         float rtl, float rtr, float rbr, float rbl,
+                         float t, Col c)
+{
+    if (w <= 0 || h <= 0 || t <= 0 || !c.a) return;
+    float hw = w * 0.5f, hh = h * 0.5f;
+    float ccx = x + hw, ccy = y + hh;
+    float cap = fminf(hw, hh);
+    rtl = clampf(rtl, 0, cap); rtr = clampf(rtr, 0, cap);
+    rbr = clampf(rbr, 0, cap); rbl = clampf(rbl, 0, cap);
+
+    int x0 = (int)floorf(x) - 1, y0 = (int)floorf(y) - 1;
+    int x1 = (int)ceilf(x + w) + 1, y1 = (int)ceilf(y + h) + 1;
+    for (int yy = y0; yy < y1; ++yy) {
+        if (yy < cv->cy0 || yy >= cv->cy1) continue;
+        for (int xx = x0; xx < x1; ++xx) {
+            if (xx < cv->cx0 || xx >= cv->cx1) continue;
+            float px = (float)xx + 0.5f - ccx, py = (float)yy + 0.5f - ccy;
+            float r = px < 0 ? (py < 0 ? rtl : rbl) : (py < 0 ? rtr : rbr);
+            float qx = fabsf(px) - (hw - r), qy = fabsf(py) - (hh - r);
+            float mx = fmaxf(qx, 0.0f), my = fmaxf(qy, 0.0f);
+            float d = sqrtf(mx * mx + my * my) + fminf(fmaxf(qx, qy), 0.0f) - r;
+            float cov = clampf(0.5f - fabsf(d + t * 0.5f) + t * 0.5f, 0.0f, 1.0f);
             if (cov > 0) blend(cv, xx, yy, c, cov);
         }
     }
@@ -2690,13 +2955,12 @@ static void window_read(Cell *e)
     e->state = PS_STOPPED;
     if (!*e->src_path) return;                   /* nothing to look for */
 
-    JV *tree = sway_query(IPC_GET_TREE);
+    const JV *tree = sway_tree_cached();
     if (!tree) return;
 
     char list[256] = "";
     int  found = 0;
     window_scan(tree, e->src_path, NULL, list, sizeof(list), &found);
-    jfree(tree);
 
     if (!found) return;                          /* not running: no cell */
     e->state = PS_PLAYING;
@@ -3127,6 +3391,8 @@ struct Bar {
     int reg_w, reg_y, reg_h;    /* the input region as the compositor has it */
     int tip_edge;               /* -1 the panel is flush left, +1 right, 0 no */
     uint32_t last_fit;          /* when we last asked for a new size         */
+    uint32_t last_commit;       /* ...and when we last committed a frame     */
+    int  last_slot;             /* the buffer currently on screen            */
     float cal_x0, cal_x1, cal_x2, cal_x3, cal_y0, cal_y1;  /* the ‹ › boxes */
     int  tip_h;                 /* extra surface for the hover text, logical */
     int  tip_cell;              /* which cell it belongs to, or -1          */
@@ -3134,6 +3400,13 @@ struct Bar {
                                                     full bar, so the folded
                                                     strip can line up with it */
     float wsx0[MAX_WORKSPACES], wsx1[MAX_WORKSPACES];   /* and each workspace */
+    float wsbx0, wsbx1, wsbw;    /* the block: left, right, widest button  */
+    float wsnx0[MAX_WORKSPACES + 1], wsnx1[MAX_WORKSPACES + 1];
+                                 /* and by number, ghosts included       */
+    struct { float x0, x1; int num; char name[128]; } wsbtn[MAX_WORKSPACES * 2];
+    int   wsbtn_n;               /* every button, in the order drawn     */
+    bool  soon;                  /* this frame skips the redraw_ms hold    */
+    uint32_t shrink_since;       /* content has been narrower since then   */
     struct { float x0, x1; int cell; } chit[MAX_CELLS];
     int chits;
 };
@@ -3153,12 +3426,25 @@ static Bar   *pointer_bar = NULL;
 static bool   running = true;
 
 static void bar_render(Bar *b);
+static bool bar_animating(Bar *b);
 static void bar_damage(Bar *b) { if (b) { b->dirty = true; } }
+
+/* Some frames must not wait for redraw_ms. A clock a quarter of a second late
+ * is nothing; the workspace you just switched to lighting up a quarter of a
+ * second late is the bar feeling broken, and switching back inside that window
+ * showed nothing at all because the two frames merged into one. */
+static void bar_damage_now(Bar *b) { if (b) { b->dirty = true; b->soon = true; } }
 
 static void damage_all(void)
 {
     for (int i = 0; i < output_count; ++i)
         if (outputs[i].bar) bar_damage(outputs[i].bar);
+}
+
+static void damage_all_now(void)
+{
+    for (int i = 0; i < output_count; ++i)
+        if (outputs[i].bar) bar_damage_now(outputs[i].bar);
 }
 
 static bool output_wanted(const char *name)
@@ -3230,6 +3516,7 @@ static bool bar_alloc(Bar *b)
     if (b->pool && b->bw == bw && b->bh == bh) return true;
 
     bar_free_buffers(b);
+    b->last_slot = -1;
     b->bw = bw;
     b->bh = bh;
     b->stride = bw * 4;
@@ -3243,6 +3530,7 @@ static bool bar_alloc(Bar *b)
 
     b->pool_data = mem;
     b->pool_size = total;
+    wl_count.pool++;
     b->pool = wl_shm_create_pool(shm, fd, (int32_t)total);
     close(fd);
     for (int i = 0; i < 2; ++i) {
@@ -3454,8 +3742,31 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
         Col track = cfg.dim;                       /* visible, or a part filled
                                                     * gauge just looks short */
         track.a = 110;
-        fill_rect(cv, x, y, w, h, track);
-        if (have) fill_rect(cv, x, y, w * f, h, fillc);
+        /* Split into ten, and the gauge can be read as a number: four lit
+         * blocks is forty percent without measuring it against anything. A
+         * solid bar only ever said "about half". */
+        int segs = cfg.slim_bar_segs;
+        float sgap = fmaxf(1.0f, (float)cfg.slim_bar_gap * s);
+        /* Ten blocks in a narrow cell came out under two pixels each and the
+         * dividers vanished, so it read as one solid bar again. Halve the
+         * count instead of giving up on it. */
+        while (segs > 2 && (w - (float)(segs - 1) * sgap) / (float)segs < 2.0f * s)
+            segs /= 2;
+        float sw = segs > 1 ? (w - (float)(segs - 1) * sgap) / (float)segs : 0;
+        if (segs > 1 && sw < 1.5f) segs = 0;       /* too narrow to read */
+        if (segs > 1) {
+            for (int i = 0; i < segs; ++i) {
+                float bx = x + (float)i * (sw + sgap);
+                fill_rect(cv, bx, y, sw, h, track);
+                if (!have) continue;
+                float f0 = (float)i / (float)segs, f1 = (float)(i + 1) / (float)segs;
+                if (f >= f1)     fill_rect(cv, bx, y, sw, h, fillc);
+                else if (f > f0) fill_rect(cv, bx, y, sw * (f - f0) * (float)segs, h, fillc);
+            }
+        } else {
+            fill_rect(cv, x, y, w, h, track);
+            if (have) fill_rect(cv, x, y, w * f, h, fillc);
+        }
         if (dir == 2) return;
 
         /* The pips run a colour ramp away from the fill: warm into red while
@@ -3588,48 +3899,74 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
                 (0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)ph / 900.0f));
     }
 
-    /* one fixed slot per workspace number, so slot 3 is always workspace 3 */
-    /* always the full set, so an empty workspace still holds its place and
-     * the lit ones never move */
-    int slots = cfg.slim_ws_slots;
-    if (slots <= 0) {
-        for (int i = 0; i < ws_count; ++i)
-            if ((ws_on_bar(b, &ws_list[i]) || cfg.ws_other) &&
-                ws_list[i].num > slots) slots = ws_list[i].num;
-    }
-
     float tick = 14.0f * s;
     b->hits = 0;
     b->chits = 0;
-    /* Lined up, a workspace keeps the place its button has in the full bar,
-     * so folding does not shuffle them either. Numbers with no workspace have
-     * no button to line up with, so they are simply not there. */
-    bool ws_aligned = cfg.slim_align != 0;
-    if (ws_aligned) {
-        bool any = false;
-        for (int i = 0; i < ws_count && i < MAX_WORKSPACES; ++i)
-            if (b->wsx1[i] > b->wsx0[i]) { any = true; break; }
-        ws_aligned = any;
+
+    /* The workspace marks. Lined up (slim_align=1) they are the open bar's own
+     * buttons, one for one — the same set, the same left edges, the same
+     * widths — taken from the layout pass that ran just before this. So a
+     * mark is exactly where its button is, and you click the same spot folded
+     * or open. Letting the strip pick its own count (slim_ws_slots) could
+     * never match: ten marks against five buttons had to land somewhere the
+     * buttons were not. That count is only for the packed layout now.
+     *
+     * Packed (slim_align=0), one fixed slot per number, slot 3 always
+     * workspace 3. */
+    typedef struct { float x, w; Ws *ws; int num; const char *name; } Mark;
+    Mark mk[MAX_WORKSPACES * 2];
+    int nmk = 0;
+    char ghostname[MAX_WORKSPACES * 2][8];
+
+    if (cfg.slim_align && b->wsbtn_n > 0) {
+        for (int k = 0; k < b->wsbtn_n && nmk < MAX_WORKSPACES * 2; ++k) {
+            Mark *m = &mk[nmk];
+            m->x = b->wsbtn[k].x0 * s;
+            m->w = (b->wsbtn[k].x1 - b->wsbtn[k].x0) * s;
+            if (cfg.slim_ws_w > 0) m->w = (float)cfg.slim_ws_w * s;
+            m->num = b->wsbtn[k].num;
+            m->ws = m->num >= 1 ? ws_by_num(b, m->num) : NULL;
+            if (!m->ws)                            /* a named one: by name */
+                for (int i = 0; i < ws_count; ++i)
+                    if (!strcmp(ws_list[i].name, b->wsbtn[k].name)) { m->ws = &ws_list[i]; break; }
+            snprintf(ghostname[nmk], sizeof ghostname[nmk], "%d", m->num);
+            m->name = m->ws ? m->ws->name : ghostname[nmk];
+            nmk++;
+        }
+    } else {
+        int slots = cfg.slim_ws_slots;
+        if (slots <= 0)
+            for (int i = 0; i < ws_count; ++i)
+                if ((ws_on_bar(b, &ws_list[i]) || cfg.ws_other) &&
+                    ws_list[i].num > slots) slots = ws_list[i].num;
+        if (slots > MAX_WORKSPACES) slots = MAX_WORKSPACES;
+        float sw0 = cfg.slim_ws_w > 0 ? (float)cfg.slim_ws_w * s : tick;
+        for (int i = 1; i <= slots; ++i) {
+            Mark *m = &mk[nmk];
+            m->x = x + (float)(i - 1) * (sw0 + gap);
+            m->w = sw0;
+            m->num = i;
+            m->ws = ws_by_num(b, i);
+            snprintf(ghostname[nmk], sizeof ghostname[nmk], "%d", i);
+            m->name = m->ws ? m->ws->name : ghostname[nmk];
+            nmk++;
+        }
     }
 
-    for (int i = 1; i <= slots; ++i) {
-        Ws *w = ws_by_num(b, i);
-        float sx = x, sw = tick;
-        if (ws_aligned) {
-            if (!w) continue;                      /* nothing to sit under */
-            int wi = (int)(w - ws_list);
-            if (wi < 0 || wi >= MAX_WORKSPACES || b->wsx1[wi] <= b->wsx0[wi]) continue;
-            sx = b->wsx0[wi] * s;
-            sw = (b->wsx1[wi] - b->wsx0[wi]) * s - gap * 0.5f;
-        }
+    for (int k = 0; k < nmk; ++k) {
+        Ws *w = mk[k].ws;
+        float sx = mk[k].x, sw = mk[k].w;
+        if (sw <= 0.0f) continue;
+        /* Brightness says used from unused: a free number is barely a shadow,
+         * one with a workspace on it is solid. */
         Col c = cfg.dim;
-        c.a = 60;                                  /* empty slot: a faint place holder */
+        c.a = 40;
         bool mine = w ? ws_on_bar(b, w) : true;
         if (w) {
             if (w->urgent) c = cfg.urgent;
             else if (w->focused) c = cfg.hl;
             else if (w->visible) c = cfg.accent;
-            else { c = cfg.dim; c.a = 170; }
+            else { c = cfg.dim; c.a = 205; }
 
             /* Another screen's workspace is shown, but never with this
              * screen's emphasis: focused there is not focused here. */
@@ -3649,14 +3986,16 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
                            faint ? 0.001f : lf, lc);
             }
         }
-        if (w && b->hits < MAX_WORKSPACES) {      /* still switchable when folded */
+        /* Every mark switches, a free one included — clicking it opens that
+         * workspace, the same as its button does open. */
+        if (b->hits < MAX_WORKSPACES) {
             b->hit[b->hits].x0 = sx / s;
             b->hit[b->hits].x1 = (sx + sw) / s;
-            str_set(b->hit[b->hits].name, sizeof(b->hit[b->hits].name), w->name);
+            str_set(b->hit[b->hits].name, sizeof(b->hit[b->hits].name), mk[k].name);
             b->hits++;
         }
-        if (!ws_aligned) x += tick + gap;
     }
+    if (nmk > 0) x = mk[nmk - 1].x + mk[nmk - 1].w + gap;
 
     if (!cfg.cell_count) {                         /* status_command fallback */
         float rx = (float)cv->w - 4.0f * s;
@@ -3706,11 +4045,48 @@ static void draw_signals(Canvas *cv, Bar *b, float y, float h, float s, Runs *rs
             if (c0 < x + gap) c0 = x + gap;
             if (c1 > (float)cv->w - 3.0f * s) c1 = (float)cv->w - 3.0f * s;
             /* inset by the same padding the text has, so the mark lines up
-               with the words that were there a moment ago */
-            float cpad = (float)cfg.cell[idx[k]].pad * s;
+               with the words that were there a moment ago. A gauge is the
+               exception: it has ten segments to fit and a short cell like a
+               battery percentage left it too cramped to read, so it takes the
+               whole cell. */
+            float cpad = mode[k] == SLIM_BAR ? (float)cfg.slim_bar_pad * s
+                                             : (float)cfg.cell[idx[k]].pad * s;
             if (c1 - c0 - 2.0f * cpad < 4.0f * s) { aligned = false; break; }
             px[k] = c0 + cpad;
             pw[k] = c1 - c0 - 2.0f * cpad;
+            /* A short cell — a two digit battery — leaves a gauge too small to
+             * read ten blocks in. slim_w wins over the alignment when it is
+             * set, growing about the cell's middle so the mark stays where the
+             * text was. */
+            if (cfg.cell[idx[k]].slim_w > 0) {
+                float want = (float)cfg.cell[idx[k]].slim_w * s
+                           - (mode[k] == SLIM_BAR ? 2.0f * cpad : 0.0f);
+                if (want > pw[k]) {
+                    px[k] -= (want - pw[k]) * 0.5f;
+                    pw[k]  = want;
+                    if (px[k] < x + gap) px[k] = x + gap;
+                    if (px[k] + pw[k] > (float)cv->w - 3.0f * s)
+                        px[k] = (float)cv->w - 3.0f * s - pw[k];
+                }
+            }
+        }
+    }
+
+    /* A mark grown by slim_w can reach into the one beside it — the battery
+     * sat right up against the temperature. Trim it back so there is always
+     * a clear gap of slim_bar_pad on each side between two marks. */
+    if (aligned) {
+        float sep = fmaxf(2.0f * (float)cfg.slim_bar_pad * s, 2.0f * s);
+        for (int k = 0; k < n; ++k) {
+            if (k > 0) {
+                float lim = px[k - 1] + pw[k - 1] + sep;
+                if (px[k] < lim) { pw[k] -= lim - px[k]; px[k] = lim; }
+            }
+            if (k + 1 < n) {
+                float lim = px[k + 1] - sep;
+                if (px[k] + pw[k] > lim) pw[k] = lim - px[k];
+            }
+            if (pw[k] < 2.0f * s) pw[k] = 2.0f * s;
         }
     }
 
@@ -3752,17 +4128,49 @@ static float ws_button_w(Font *f, Ws *w, float s)
                  (float)cfg.ws_min_w * s);
 }
 
-static float ws_block_w(Font *f, Bar *b, float s)
+/* The row the bar draws: with ws_slots set it is the numbers 1..n whether or
+ * not they exist, then anything else that is open — a workspace numbered past
+ * the end, or a named one. A free number is a button like any other, so it is
+ * measured, placed and clicked like one; switching to it is what creates it.
+ * Both the measuring and the drawing pass walk this, or the block comes out a
+ * different width than what goes in it. */
+typedef struct { Ws *w; bool ghost; } WsSlot;
+
+static Ws ws_ghost[MAX_WORKSPACES];
+
+static int ws_order(Bar *b, WsSlot *out, int max)
 {
-    float w = 0;
-    int n = 0;
-    for (int i = 0; i < ws_count; ++i) {
-        /* the same set the drawing walks, or the block is measured shorter
-         * than it is drawn and the next cell lands on top of it */
-        if (!ws_on_bar(b, &ws_list[i]) && !cfg.ws_other) continue;
-        w += ws_button_w(ws_font(b, &ws_list[i], f), &ws_list[i], s);
+    int n = 0, lim = cfg.ws_slots;
+    if (lim > MAX_WORKSPACES) lim = MAX_WORKSPACES;
+    for (int k = 1; k <= lim && n < max; ++k) {
+        Ws *w = ws_by_num(b, k);
+        if (w) { out[n].w = w; out[n].ghost = false; }
+        else {
+            Ws *g = &ws_ghost[k - 1];
+            memset(g, 0, sizeof(*g));
+            g->num = k;
+            snprintf(g->name, sizeof(g->name), "%d", k);
+            str_set(g->label, sizeof(g->label), g->name);
+            out[n].w = g; out[n].ghost = true;
+        }
         n++;
     }
+    for (int i = 0; i < ws_count && n < max; ++i) {
+        Ws *w = &ws_list[i];
+        if (!ws_on_bar(b, w) && !cfg.ws_other) continue;
+        if (w->num >= 1 && w->num <= lim) continue;   /* already placed above */
+        out[n].w = w; out[n].ghost = false; n++;
+    }
+    return n;
+}
+
+static float ws_block_w(Font *f, Bar *b, float s)
+{
+    WsSlot sl[MAX_WORKSPACES * 2];
+    float w = 0;
+    int n = ws_order(b, sl, MAX_WORKSPACES * 2);
+    for (int i = 0; i < n; ++i)
+        w += ws_button_w(ws_font(b, sl[i].w, f), sl[i].w, s);
     if (n > 1) w += (float)(n - 1) * (float)cfg.ws_gap * s;
     return w;
 }
@@ -3794,10 +4202,16 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
 {
     float rad = ws_radius_px(vis, s);
     float base = baseline_for(f, y0, vis, s);
-    for (int i = 0; i < ws_count; ++i) {
-        Ws *w = &ws_list[i];
+    WsSlot sl[MAX_WORKSPACES * 2];
+    int nsl = ws_order(b, sl, MAX_WORKSPACES * 2);
+    b->wsbx0 = x / s;
+    b->wsbw  = 0;
+    for (int k = 0; k <= MAX_WORKSPACES; ++k) b->wsnx0[k] = b->wsnx1[k] = 0;
+    b->wsbtn_n = 0;
+    for (int k = 0; k < nsl; ++k) {
+        Ws *w = sl[k].w;
+        int i = sl[k].ghost ? -1 : (int)(w - ws_list);
         bool mine = ws_on_bar(b, w);
-        if (!mine && !cfg.ws_other) continue;
 
         Font *wf = ws_font(b, w, f);
         float bwid = ws_button_w(wf, w, s);
@@ -3808,6 +4222,14 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
         else if (w->focused) { bg = cfg.ws_focused_bg; fg = cfg.ws_focused_fg; }
         else if (w->visible) { bg = cfg.ws_visible_bg; fg = cfg.ws_visible_fg; }
 
+        /* A number nobody is using: the same button in the same place, just
+         * faint, so the row is a fixed ten and clicking one opens it. */
+        float ga = clampf((float)cfg.ws_empty_alpha / 100.0f, 0.0f, 1.0f);
+        if (sl[k].ghost) {
+            bg = col_scale_alpha(bg, ga);
+            fg = col_scale_alpha(fg, ga);
+        }
+
         /* A workspace on another monitor is drawn as a short pill sitting on
          * the baseline: still readable, still clickable, and obviously not
          * one of this screen's. */
@@ -3817,6 +4239,19 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
 
         pill(cv, x, by, bh, bwid, s, mine ? rad : rad * 0.6f,
              col_scale_alpha(bg, bfade));
+        /* With ws_bg transparent an unused workspace was a bare number with no
+         * edge, so the row read as loose text rather than buttons. The outline
+         * gives every one the same cell, filled or not. */
+        if (cfg.ws_border > 0) {
+            float br = mine ? rad : rad * 0.6f, in = (float)cfg.ws_inset * s;
+            float oy = by, oh = bh, t0 = br, t1 = br, b0 = br, b1 = br;
+            if (in > 0) { oy += in; oh -= 2.0f * in; }
+            else if (strcmp(cfg.position, "bottom") != 0) t0 = t1 = 0;
+            else                                         b0 = b1 = 0;
+            stroke_round(cv, x, oy, bwid, oh, t0, t1, b1, b0,
+                         (float)cfg.ws_border * s,
+                         col_scale_alpha(cfg.ws_border_col, bfade));
+        }
         if (mine)
             text_draw(cv, f, x + (bwid - tw) * 0.5f, base,
                       col_scale_alpha(fg, fade), w->label);
@@ -3845,11 +4280,27 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
             str_set(b->hit[b->hits].name, sizeof(b->hit[b->hits].name), w->name);
             b->hits++;
         }
-        if (i < MAX_WORKSPACES) {                 /* for the folded strip */
+        if (i >= 0 && i < MAX_WORKSPACES) {       /* for the folded strip */
             b->wsx0[i] = x / s;
             b->wsx1[i] = (x + bwid) / s;
         }
+        /* By number as well, ghosts included: that is what the folded strip
+         * copies, so a slot is exactly its own button and not the widest
+         * one. */
+        if (w->num >= 1 && w->num <= MAX_WORKSPACES) {
+            b->wsnx0[w->num] = x / s;
+            b->wsnx1[w->num] = (x + bwid) / s;
+        }
+        if (b->wsbtn_n < MAX_WORKSPACES * 2) {
+            int q = b->wsbtn_n++;
+            b->wsbtn[q].x0 = x / s;
+            b->wsbtn[q].x1 = (x + bwid) / s;
+            b->wsbtn[q].num = w->num;
+            str_set(b->wsbtn[q].name, sizeof(b->wsbtn[q].name), w->name);
+        }
+        if (bwid > b->wsbw) b->wsbw = bwid / s;
         x += bwid + (float)cfg.ws_gap * s;
+        b->wsbx1 = (x - (float)cfg.ws_gap * s) / s;
     }
 }
 
@@ -4176,6 +4627,20 @@ static int bar_natural_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
     if (groups > 1) total += (float)(groups - 1) * gap * 2.0f;
     total += (float)cfg.pad_x * s + (float)(cfg.pad_right >= 0 ? cfg.pad_right : cfg.pad_x) * s;
 
+    /* The folded strip can need more room than the open bar — ten workspace
+     * slots against however many are actually open. The surface is sized once
+     * for both, so folding never has to ask the compositor for a new width
+     * (and could not: the strip is drawn after the fitting). */
+    /* Only the packed strip picks its own count; lined up it is the open
+     * bar's buttons and needs no more room than they do. */
+    if (cfg.signals && !cfg.slim_align && cfg.slim_ws_slots > 0 && b->wsbw > 0) {
+        int n = cfg.slim_ws_slots;
+        float strip = (float)n * (cfg.slim_ws_w > 0 ? (float)cfg.slim_ws_w : b->wsbw)
+                    + (float)(n - 1) * (float)cfg.ws_gap;
+        float have = b->wsbx1 - b->wsbx0;
+        if (strip > have) total += (strip - have) * s;
+    }
+
     int want = (int)ceilf(total / s);
     if (want < cfg.min_width) want = cfg.min_width;
 
@@ -4217,6 +4682,11 @@ static void bar_fit_height(Bar *b)
      * real width — and want_w is still zero until the width has been fitted
      * once, which since it stopped fitting during animations is exactly when
      * a fold would ask for a new height. */
+    uint32_t now = now_ms();
+    if (b->last_fit && (int32_t)(now - b->last_fit) < 100) return;
+    b->last_fit = now;
+    wl_count.resize++;
+
     uint32_t w = 0;
     if (cfg.min_width > 0) {
         w = (uint32_t)(b->want_w > 0 ? b->want_w : b->w);
@@ -4284,10 +4754,18 @@ static void hover_cal_build(Cell *e)
 /* `cal`, or anything else whose output is the panel. Run once when the hover
  * starts and kept until it ends, so resting on the clock does not spawn a
  * process every frame. */
+/* Run it, but never wait on it for long: this happens on the frame the
+ * pointer arrives, so a command that blocks blocks the whole bar — which is
+ * what a frozen bar turns out to be. */
 static void hover_cmd_run(Cell *e)
 {
     e->out_hover[0] = 0;
-    FILE *p = popen(e->hover_cmd, "r");
+
+    char guarded[320];
+    snprintf(guarded, sizeof(guarded), "timeout 2 sh -c %c%s%c",
+             '\'', e->hover_cmd, '\'');
+
+    FILE *p = popen(guarded, "r");
     if (!p) return;
     size_t n = fread(e->out_hover, 1, sizeof(e->out_hover) - 1, p);
     pclose(p);
@@ -4389,10 +4867,24 @@ static void bar_fit_width(Bar *b, Canvas *cv, Font *f, float vis, float s)
     if (b->last_fit && (int32_t)(now - b->last_fit) < 250) return;
 
     int want = bar_natural_width(b, cv, f, vis, s);
+
+    /* Growing happens at once — clipped text is worse than a bar that moves.
+     * Shrinking waits. A floating bar is centred, so every change of width
+     * moves everything on it, and most of them undo themselves: the battery
+     * going from 100 to 99, a temperature losing a digit, a cell that blinks
+     * empty for a second. A shrink smaller than shrink_px is ignored outright,
+     * and a larger one has to hold for shrink_s before the bar follows. */
+    if (want < b->w) {
+        if (b->w - want < cfg.shrink_px) { b->shrink_since = 0; return; }
+        if (!b->shrink_since) { b->shrink_since = now ? now : 1; return; }
+        if ((int32_t)(now - b->shrink_since) < cfg.shrink_s * 1000) return;
+    }
+    b->shrink_since = 0;
     if (want == b->want_w || abs(want - b->w) < 4) return;
 
     b->want_w  = want;
     b->last_fit = now;
+    wl_count.resize++;
     ls_set_size(b->ls, (uint32_t)want, (uint32_t)b->h);
     wl_surface_commit(b->surf);
 }
@@ -4589,7 +5081,13 @@ static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
          * positions to line up with. Run the full layout with the canvas
          * clipped to nothing: it draws no pixels and records where every cell
          * and workspace would sit. */
-        if (!b->measured_full) {
+        /* Every folded frame lays the open bar out first, with the canvas
+         * clipped to nothing: no pixels, just where every button and cell
+         * would be right now. Doing it only once went stale — a workspace
+         * opened while folded had no button to line up with, and started
+         * folded the surface was not even its real width yet. The strip is
+         * redrawn rarely, so the pass costs next to nothing. */
+        {
             int sx0 = cv->cx0, sy0 = cv->cy0, sx1 = cv->cx1, sy1 = cv->cy1;
             canvas_clip(cv, 0, 0, 0, 0);
             bar_measure_layout(cv, b, f, y0, vis, s, bw);
@@ -4597,6 +5095,7 @@ static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
             b->measured_full = true;
             b->hits = 0;
             b->chits = 0;
+            bar_fit_width(b, cv, f, vis, s);
         }
         draw_signals(cv, b, y0, vis, s, &rs);
         return;
@@ -4639,6 +5138,27 @@ static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
 static void bar_render(Bar *b)
 {
     if (!b->configured || b->closed) return;
+
+    /* A hard ceiling on how often the compositor is asked to do anything.
+     * Whatever decides a frame is needed — an animation, a configure, a cell
+     * whose width wobbles — it cannot turn into an unbounded stream of
+     * commits, and sway cannot be made to allocate faster than it can free.
+     * The frame is not lost, only deferred: dirty stays set. */
+    /* Two floors on how often a frame goes out.
+     *
+     * The 8 ms one is a hard ceiling of ~120 fps for anything animating. The
+     * other is for content: ten cells on their own timers wake the bar three
+     * times a second, each with one number changed, and every one of those is
+     * a full round trip through the compositor. Holding them for redraw_ms
+     * merges whatever arrives in the same window into a single frame. A clock
+     * a quarter of a second late is not a clock anyone notices. */
+    uint32_t now = now_ms();
+    if (b->last_commit && (int32_t)(now - b->last_commit) < 8) return;
+
+    bool moving = bar_animating(b) || b->hovered || scroll_running || b->soon;
+    if (!moving && cfg.redraw_ms > 0 && b->last_commit &&
+        (int32_t)(now - b->last_commit) < cfg.redraw_ms) return;
+
     if (!bar_alloc(b)) return;
 
     int slot = -1;
@@ -4651,20 +5171,27 @@ static void bar_render(Bar *b)
     Canvas cv = { (uint32_t *)b->bufmem[slot], b->bw, b->bh, 0, 0, b->bw, b->bh };
     bar_paint(b, &cv, visL, s);
 
-    /* hand the buffer over */
-    b->busy[slot] = true;
-    wl_surface_set_buffer_scale(b->surf, b->scale);
-    wl_surface_attach(b->surf, b->buf[slot], 0, 0);
-    wl_surface_damage_buffer(b->surf, 0, 0, b->bw, b->bh);
-
+    /* Nothing to say? Then say nothing.
+     *
+     * Ten cells on two-to-ten second timers wake the bar a couple of times a
+     * second, but most of those produce the same picture — the volume is
+     * still 80%, the clock is still 12:41. Comparing the frame we just drew
+     * against the one on screen costs a memcmp of the buffer and saves the
+     * whole round trip: attach, damage, commit, and everything the
+     * compositor does with it. */
     /* only the visible strip takes clicks — the rest of the surface is
      * transparent and must not swallow them */
     /* the bar, plus the panel while one is open: the pointer has to be able
      * to rest on the panel without the hover ending under it. Sent only when
-     * it changes — the compositor allocates a region for every one of these. */
+     * it changes — the compositor allocates a region for every one of these —
+     * but ahead of the skip below: a frame with nothing new to show is still a
+     * frame whose region may have changed, and going without one is a bar the
+     * pointer falls through. */
     int rv = (int)ceilf(visL) + (b->tip_h > 0 ? b->tip_h : 0);
     int ry = top ? 0 : b->h - rv;
-    if (rv != b->reg_h || ry != b->reg_y || b->w != b->reg_w) {
+    bool new_region = rv != b->reg_h || ry != b->reg_y || b->w != b->reg_w;
+    if (new_region) {
+        wl_count.region++;
         struct wl_region *reg = wl_compositor_create_region(compositor);
         wl_region_add(reg, 0, ry, b->w, rv);
         wl_surface_set_input_region(b->surf, reg);
@@ -4672,12 +5199,33 @@ static void bar_render(Bar *b)
         b->reg_h = rv; b->reg_y = ry; b->reg_w = b->w;
     }
 
+    if (b->last_slot >= 0 && b->last_slot != slot &&
+        memcmp(b->bufmem[slot], b->bufmem[b->last_slot],
+               (size_t)b->stride * (size_t)b->bh) == 0) {
+        /* Nothing new to show, but a region that was just set is only state
+         * until something commits it. */
+        if (new_region) wl_surface_commit(b->surf);
+        b->dirty = false;
+        b->soon = false;
+        return;
+    }
+
+    /* hand the buffer over */
+    b->last_slot = slot;
+    b->busy[slot] = true;
+    wl_surface_set_buffer_scale(b->surf, b->scale);
+    wl_surface_attach(b->surf, b->buf[slot], 0, 0);
+    wl_surface_damage_buffer(b->surf, 0, 0, b->bw, b->bh);
+
     if (cfg.exclusive)                       /* the panel must not reserve
                                                 space: it is transient */
         ls_set_exclusive_zone(b->ls, (int)ceilf(visL) + cfg.margin);
 
+    wl_count.commit++;
+    b->last_commit = now_ms();
     wl_surface_commit(b->surf);
     b->dirty = false;
+    b->soon = false;
 }
 /* ------------------------------------------------------------- animation */
 
@@ -4710,9 +5258,16 @@ static void bar_anim_step(Bar *b, uint32_t t)
     b->dirty = true;
 }
 
+/* Taking the grab is always re-sent, never skipped because we think we still
+ * have it. The compositor can take it back without telling us — a leave that
+ * never arrives because the surface moved or was remapped leaves kbd_grab
+ * saying true while the keyboard is long gone, and every later enter then does
+ * nothing, so keys go to the window underneath until the bar is restarted.
+ * Dropping it is still only sent on a change; that one cannot go stale. */
 static void bar_set_grab(Bar *b, bool on)
 {
-    if (!cfg.hover_keys || b->kbd_grab == on || !b->ls) return;
+    if (!cfg.hover_keys || !b->ls) return;
+    if (!on && !b->kbd_grab) return;
     b->kbd_grab = on;
     ls_set_keyboard(b->ls, on ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE
                               : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
@@ -4725,10 +5280,23 @@ static void ls_configure(void *data, struct zwlr_layer_surface_v1 *s,
                          uint32_t serial, uint32_t w, uint32_t h)
 {
     Bar *b = (Bar *)data;
+    wl_count.ack++;
     ls_ack_configure(s, serial);
+
+    bool changed = (w && (int)w != b->w) || (h && (int)h != b->h) || !b->configured;
     if (w) b->w = (int)w;
     if (h) b->h = (int)h;
     b->configured = true;
+    if (!changed) return;            /* nothing to redraw, and no ping-pong */
+
+    /* A different surface needs everything measured against it again, a fresh
+     * input region, and the keyboard asked for again — none of that carries
+     * over, and a stale input region is a bar the pointer goes straight
+     * through. */
+    b->measured_full = false;
+    b->reg_w = -1;
+    if (b->kbd_grab && cfg.hover_keys)
+        ls_set_keyboard(b->ls, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
     b->dirty = true;
     bar_render(b);
 }
@@ -4755,6 +5323,7 @@ static void bar_create(Output *o)
     b->w = 0;
     b->h = bar_wanted_h(b);
     b->tip_pinned = -1;
+    b->last_slot = -1;
     b->vis = cfg.start_collapsed ? 0.0f : 1.0f;
     b->anim_to = b->vis;
     b->collapsed = cfg.start_collapsed != 0;
@@ -4929,6 +5498,14 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial, struct wl_
     (void)d; (void)p; (void)serial;
     Bar *b = bar_of_surface(surf);
     if (!b) return;
+    if (pointer_bar && pointer_bar != b) {
+        /* a leave for the bar we already left, arriving after the enter for
+         * the one we are on: dropping the grab here would take it off the
+         * wrong surface and lose the pointer with it */
+        b->hovered = false;
+        bar_set_grab(b, false);
+        return;
+    }
     b->hovered = false;
     b->tip_pinned = -1;
     b->dirty = true;
@@ -5236,6 +5813,12 @@ static void usage(void)
 "                      this rather than `pkill swbr` in the sway config: sway\n"
 "                      forks each exec_always without waiting, so a kill on\n"
 "                      one line races the bar started on the next\n"
+"  no_tree=0           1 = never ask sway for the tree (no load dots, no\n"
+"                      source=window cells). tree_min_s=5 is how often it\n"
+"                      may be asked for at most, and only after a change\n"
+"  --minimal           a bare bar: workspaces only, no cells, no tree, no\n"
+"                      keyboard grab, no fifo. For finding out which part of\n"
+"                      swbr a compositor is unhappy about\n"
 "  --probe             print outputs, sizes, font metrics and cell values\n"
 "  --slim              start folded (same as start_collapsed=1)\n"
 "  --toggle            fold or unfold the running bar. Also --fold/--unfold\n"
@@ -5263,7 +5846,7 @@ static void usage(void)
 "\n"
 "workspaces\n"
 "  ws_names=0          0 = number only, 1 = the full workspace name\n"
-"  ws_pad=11 ws_gap=4 ws_min_w=0\n"
+"  ws_pad=11 ws_gap=4 ws_min_w=0 ws_border=0\n""  ws_slots=10         show the numbers 1..n whether or not they exist\n""  ws_empty_alpha=35   how visible a free number is, percent\n"
 "  ws_inset=0          gap above and below the buttons; >0 makes them pills\n"
 "  ws_radius=0         0 = square, the button spans the whole bar height\n"
 "                      -1 = a full pill when inset, else follows radius\n"
@@ -5364,6 +5947,10 @@ static void usage(void)
 "  msg_fifo=           default $XDG_RUNTIME_DIR/swbr.fifo\n"
 "  msg_target=         name of the cell a message takes over while it lasts\n"
 "  msg_timeout=8       seconds, 0 = until cleared. Click it to dismiss\n"
+"  redraw_ms=250       cell updates are held this long and merged into one\n"
+"                      frame; refresh=1 says the same in seconds. Anything\n"
+"                      moving — an animation, a hover, a scrolling cell —\n"
+"                      ignores it\n"
 "  msg_flash=1         pulse the folded strip in the message colour\n"
 "  msg_panel=3         seconds the message also drops into the panel\n"
 "  msg_info= msg_warn= msg_error=\n"
@@ -5377,7 +5964,8 @@ static void usage(void)
 "  signals=1           the folded strip keeps saying something: a fixed slot\n"
 "                      per workspace, twelve dots for a clock cell, a gauge\n"
 "                      for anything with a percentage\n"
-"  slim_ws_slots=10    always show this many workspace slots\n"
+"  slim_ws_slots=10    slots in the packed strip (slim_align=0); lined up, the\n"
+"                      strip is the open bar's own buttons\n""  slim_bar_segs=10    folded gauges are split into this many blocks\n""  slim_bar_gap=2      px between those blocks\n""  slim_bar_pad=3      px either side of a folded gauge\n""  slim_ws_w=0         folded slot width, 0 = its own button\n""  shrink_px=24 shrink_s=30   a floating bar ignores narrowing by less than\n""                      shrink_px, and waits shrink_s before a bigger one\n"
 "  start_collapsed=0\n"
 "  SIGUSR1 folds or unfolds every bar:  pkill -USR1 swbr\n"
 "\n"
@@ -5413,8 +6001,10 @@ static void dump_config(void)
            c.min_width, c.align_x, (double)c.radius, c.outputs);
     printf("\n# --- workspaces ---\n");
     printf("ws_names=%d\nws_pad=%d\nws_gap=%d\nws_min_w=%d\nws_inset=%d\nws_radius=%g\n"
+           "ws_border=%d\nws_slots=%d\nws_empty_alpha=%d\n"
            "ws_click=%d\nscroll_workspace=%d\nmode_show=%d\n",
            c.ws_names, c.ws_pad, c.ws_gap, c.ws_min_w, c.ws_inset, (double)c.ws_radius,
+           c.ws_border, c.ws_slots, c.ws_empty_alpha,
            c.ws_click, c.scroll_workspace, c.mode_show);
     printf("\n# --- text ---\n");
     printf("# font=\n# font_alt=\nui_scale=%g\ntext_px=%g\nws_px=%g\ntext_y=%g\n"
@@ -5427,6 +6017,7 @@ static void dump_config(void)
     print_color("separator_color", c.separator_color);
     printf("# cell=clock\n# clock.cmd=date '+%%H:%%M'\n# clock.interval=10\n");
     printf("\n# --- messages ---\n");
+    printf("redraw_ms=%d\n", c.redraw_ms);
     printf("# msg_fifo=\n# msg_target=cmus\nmsg_timeout=%d\nmsg_flash=%d\n",
            c.msg_timeout, c.msg_flash);
     print_color("msg_info", c.msg_info);
@@ -5438,10 +6029,13 @@ static void dump_config(void)
     printf("# status_command=~/bin/sway_bar_status.sh\ninterval=%d\n", c.interval);
     printf("\n# --- folding ---\n");
     printf("hide_key=%s\nhover_keys=%d\ncollapsed_px=%d\nanim_ms=%d\nsignals=%d\n"
-           "slim_ws_slots=%d\n"
+           "slim_ws_slots=%d\nslim_bar_segs=%d\nslim_bar_gap=%d\nslim_bar_pad=%d\n"
+           "slim_ws_w=%d\nshrink_px=%d\nshrink_s=%d\n"
            "start_collapsed=%d\n",
            c.hide_key, c.hover_keys, c.collapsed_px, c.anim_ms, c.signals,
-           c.slim_ws_slots, c.start_collapsed);
+           c.slim_ws_slots, c.slim_bar_segs, c.slim_bar_gap, c.slim_bar_pad,
+           c.slim_ws_w, c.shrink_px, c.shrink_s,
+           c.start_collapsed);
     printf("\n# --- mouse ---\n# button2=cmus_control toggle\n");
     printf("\n# --- colors ---\n");
     print_color("bg", c.bg);
@@ -5453,6 +6047,7 @@ static void dump_config(void)
     print_color("running", c.running);
     print_color("slim_warm", c.slim_warm);
     print_color("outline", c.outline);
+    print_color("ws_border_col", c.ws_border_col);
     print_color("ws_bg", c.ws_bg);
     print_color("ws_fg", c.ws_fg);
     print_color("ws_focused_bg", c.ws_focused_bg);
@@ -5469,6 +6064,7 @@ static void dump_config(void)
 
 static int  probe = 0;
 static int  do_replace = 0;
+static int  minimal = 0;
 static int  cfg_start_collapsed_arg = 0;
 
 static void probe_report(void)
@@ -5663,10 +6259,12 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[i], "--dump-config")) { dump_config(); return 0; }
         else if (!strcmp(argv[i], "--probe")) probe = 1;
         else if (!strcmp(argv[i], "--replace")) do_replace = 1;
+        else if (!strcmp(argv[i], "--minimal")) minimal = 1;
         else if (!strcmp(argv[i], "--slim") || !strcmp(argv[i], "--collapsed"))
             cfg_start_collapsed_arg = 1;
     }
 
+    wl_trace = getenv("SWBR_TRACE") != NULL;
     if (do_replace) replace_running();   /* clear the way before asking for a surface */
 
     config_defaults(&cfg);
@@ -5687,13 +6285,20 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (!strcmp(a, "--config")) { i++; continue; }
         if (!strcmp(a, "--probe") || !strcmp(a, "--slim") ||
-            !strcmp(a, "--replace") || !strcmp(a, "--collapsed")) continue;
+            !strcmp(a, "--replace") || !strcmp(a, "--minimal") ||
+            !strcmp(a, "--collapsed")) continue;
         if (!strcmp(a, "-s") && i + 1 < argc) a = argv[++i];
         else if (!strncmp(a, "--", 2)) a += 2;
         char buf[4096];
         str_set(buf, sizeof(buf), a);
         char *eq = strchr(buf, '=');
-        if (!eq) continue;
+        if (!eq) {
+            /* A mistyped flag used to be swallowed in silence, so the test
+             * you thought you were running was the one you were not. */
+            if (!strncmp(argv[i], "-", 1))
+                fprintf(stderr, "swbr: unknown option '%s' (see --help)\n", argv[i]);
+            continue;
+        }
         *eq = 0;
         config_set(&cfg, trim(buf), trim(eq + 1));
     }
@@ -5723,12 +6328,29 @@ int main(int argc, char **argv)
     if (!compositor || !shm) die("compositor is missing wl_compositor/wl_shm");
     if (!layer_shell) die("compositor does not support wlr-layer-shell");
 
+    no_tree_flag = cfg.no_tree;      /* the tree reader reads this, not cfg */
+    ws_sort_flag = cfg.ws_sort;
+    tree_min_ms  = cfg.tree_min_s > 0 ? cfg.tree_min_s * 1000 : 5000;
+
+    if (minimal) {                   /* a bare bar, for bisecting */
+        cfg.cell_count = 0;
+        cfg.ws_cpu = 0;
+        cfg.signals = 0;
+        cfg.hover_keys = 0;
+        cfg.msg_flash = 0;
+        cfg.msg_panel = 0;
+        cfg.status_command[0] = 0;
+        no_tree_flag = 1;
+        fprintf(stderr, "swbr: minimal — workspaces only, no cells, no tree,\n"
+                        "swbr:           no keyboard grab, no message fifo\n");
+    }
+
     for (int i = 0; i < output_count; ++i)
         if (outputs[i].alive && !outputs[i].bar) bar_create(&outputs[i]);
 
     if (*cfg.status_command && !cfg.cell_count) status_spawn();
     cells_tick();
-    msg_open();
+    if (!minimal) msg_open();
 
     if (probe) {
         if (cfg.ws_cpu) cpu_sample();           /* the first of the two */
@@ -5757,7 +6379,14 @@ int main(int argc, char **argv)
             redraw = true;
         }
 
-        if (sway_events_pending()) { ws_reload(cfg.ws_names != 0); redraw = true; }
+        bool redraw_now = false;
+        if (sway_events_pending()) {          /* something moved: the cached
+                                                 tree is stale */
+            sway_tree_forget();
+            if (ws_stale) ws_reload(cfg.ws_names != 0);   /* else: from the event */
+            ws_stale = false;
+            redraw_now = true;
+        }
         if (status_read()) redraw = true;
         cells_tick();
         if (cells_read()) redraw = true;
@@ -5774,7 +6403,9 @@ int main(int argc, char **argv)
         }
         if (msg_expiry_due()) redraw = true;
 
-        if (cfg.ws_cpu && cfg.ws_cpu_interval > 0) {
+        wl_trace_tick();
+
+    if (cfg.ws_cpu && cfg.ws_cpu_interval > 0) {
             static uint32_t cpu_next;
             if (!cpu_next || (int32_t)(now_ms() - cpu_next) >= 0) {
                 cpu_sample();
@@ -5797,7 +6428,8 @@ int main(int argc, char **argv)
             bar_anim_step(b, t);
             if (bar_animating(b)) animating = true;
         }
-        if (redraw) damage_all();
+        if (redraw_now) damage_all_now();
+        else if (redraw) damage_all();
 
         scroll_running = false;
         for (int i = 0; i < output_count; ++i) {
@@ -5818,17 +6450,18 @@ int main(int argc, char **argv)
         for (int i = 0; i < cfg.cell_count; ++i)
             if (cfg.cell[i].fd >= 0) { pfd[n].fd = cfg.cell[i].fd; pfd[n].events = POLLIN; n++; }
 
+        bool any_dirty = false;
+        for (int i = 0; i < output_count; ++i)
+            if (outputs[i].bar && outputs[i].bar->dirty) any_dirty = true;
+
         int timeout = -1;
-        if (animating || scroll_running) timeout = 16;
+        /* A frame held back by redraw_ms has to be woken to go out. Waiting on
+         * the 100 ms cell tick put it a further tenth of a second behind
+         * whatever it was already late for. */
+        if (animating || scroll_running || any_dirty) timeout = 16;
         else if (cfg.cell_count || msg_until || (cfg.ws_cpu && cfg.ws_cpu_interval > 0))
             timeout = 100;
         else if (status_fd < 0 && *cfg.status_command) timeout = 100;
-        else {
-            bool any_dirty = false;
-            for (int i = 0; i < output_count; ++i)
-                if (outputs[i].bar && outputs[i].bar->dirty) any_dirty = true;
-            if (any_dirty) timeout = 16;
-        }
 
         int pr = poll(pfd, (nfds_t)n, timeout);
         if (pr < 0 && errno != EINTR) { wl_display_cancel_read(dpy); break; }

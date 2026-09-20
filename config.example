@@ -23,15 +23,34 @@ accent=89afc4
 hl=cb9b00
 urgent=e0533c
 
+refresh=0.25       # how often the bar may redraw, in seconds. Cell updates
+                   # inside one window are merged into a single frame; 1 is
+                   # fine for a bar of clocks and gauges. Animations and
+                   # hovers ignore it
+
 # --- workspaces -------------------------------------------------------------
 ws_names=1         # 1 = names, 0 = numbers only
 ws_other=1         # also the workspaces of your other monitors, as short pills
 ws_cpu=1           # a column of dots: how busy each workspace is, in cores
+ws_border=0        # 1 = a thin outline around every button. 0 = none, just
+                   # the gap between them
+ws_slots=10        # always show the numbers 1..10, open or not; a free one
+                   # is faint and clicking it opens that workspace. 0 = only
+                   # the ones that are open. The folded strip follows this
+ws_empty_alpha=35  # how visible a free number is, percent
 
 # --- folding ----------------------------------------------------------------
 hide_key=space     # hover the bar and press this to fold it to a thin strip
 collapsed_px=5
 slim_align=1       # folded, each mark keeps its cell's place and width
+slim_ws_slots=10   # only with slim_align=0: slots in the packed strip
+slim_bar_segs=10   # folded gauges are split into ten blocks, so four lit
+                   # blocks reads as forty percent. 0 = one solid bar
+slim_bar_gap=2     # px between those blocks
+slim_bar_pad=3     # px either side of a folded gauge, so it does not sit
+                   # flush against its neighbours
+slim_ws_w=0        # folded slot width in px. 0 = each slot copies its own
+                   # button in the open bar, so nothing moves or resizes
 
 # --- a plain cell: a command, every few seconds ------------------------------
 cell=clock

@@ -72,11 +72,15 @@ battery.hover_click=1
 
 # it can shout, too. Each level fires once on the way down and rearms when
 # the charge comes back or the cable goes in
-battery.alert=30,20,10,5
+battery.alert=30,20,10,5,1
 battery.alert_msg=BATTERY %c%%
 battery.alert_tone=250     # Hz, 0 for silence. The last levels beep longer
+battery.alert_gain=35      # loudness of the tone, percent of full scale
 battery.alert_play=aplay -q -f cd -
-# battery.alert_cmd=[ %c -le 1 ] && poweroff
+# battery.alert_vol_min=50 # if the mixer is lower, raise it for the tone only
+#                          # and put it back. 0 = leave the mixer alone
+# battery.alert_cmd=[ %c -le 1 ] && poweroff   # only runs AT a level, so 1
+                           # has to be in the list. Needs root for poweroff
 
 # --- music, if cmus is running ----------------------------------------------
 cell=music

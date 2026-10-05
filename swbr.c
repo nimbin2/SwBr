@@ -1334,6 +1334,9 @@ typedef struct {
     int   alert_lv[8], alert_n, alert_fired;
     char  alert_msg[192], alert_cmd[256], alert_play[128];
     int   alert_tone, alert_ms, alert_beeps, alert_escalate;
+    int   alert_gain;            /* loudness of the tone itself, percent */
+    int   alert_vol_min;         /* lift the mixer to this for the alert  */
+    char  alert_vol_get[160], alert_vol_set[160];
     int   cal_off;               /* months away from this one, from the arrows */
     char  out_hover[512];        /* that, already filled in                  */
     int   hover_slim;            /* folded, hovering it opens the bar        */
@@ -1562,7 +1565,12 @@ static Cell *cell_add(Config *c, const char *name)
     e->alert_ms = 1050;
     e->alert_beeps = 2;
     e->alert_escalate = 1;
+    e->alert_gain = 35;
+    e->alert_vol_min = 0;        /* nobody's mixer is touched unless asked */
     str_set(e->alert_play, sizeof(e->alert_play), "aplay -q -f cd -");
+    str_set(e->alert_vol_get, sizeof(e->alert_vol_get),
+            "amixer -M get Master | grep -o '[0-9]*%' | head -1");
+    str_set(e->alert_vol_set, sizeof(e->alert_vol_set), "amixer -M -q set Master %v%");
     str_set(e->align, sizeof(e->align), "right");
     str_set(e->pos, sizeof(e->pos), "right");
     return e;
@@ -1624,6 +1632,10 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
     else if (!strcmp(k, "alert_ms")) e->alert_ms = atoi(v);
     else if (!strcmp(k, "alert_beeps")) e->alert_beeps = atoi(v);
     else if (!strcmp(k, "alert_escalate")) e->alert_escalate = atoi(v);
+    else if (!strcmp(k, "alert_gain")) e->alert_gain = atoi(v);
+    else if (!strcmp(k, "alert_vol_min")) e->alert_vol_min = atoi(v);
+    else if (!strcmp(k, "alert_vol_get")) str_set(e->alert_vol_get, sizeof(e->alert_vol_get), v);
+    else if (!strcmp(k, "alert_vol_set")) str_set(e->alert_vol_set, sizeof(e->alert_vol_set), v);
     else if (!strcmp(k, "hover_slim")) e->hover_slim = atoi(v);
     else if (!strcmp(k, "source")) {
         if (!strcasecmp(v, "cmus")) {
@@ -3000,6 +3012,54 @@ static double bat_num(const char *base, const char *leaf)
 /* urgency 0 is an ordinary level, 1 the one before last, 2 the last: longer
  * and more of them, so the difference is audible from the next room without
  * having to count. */
+/* What the tone is piped into. Normally just alert_play. With alert_vol_min
+ * set it is wrapped in a few lines of shell: read the mixer, and only if it is
+ * below the floor, raise it, arrange to put it back, then hand over to the
+ * player. The restore is the shell's own EXIT trap, so it runs even if the
+ * alert is killed half way through — nothing should be able to leave the
+ * volume up. ALSA has no per-stream level, so this is the master control and
+ * it does move other audio for the second or two the tone lasts; alert_gain
+ * is the knob that touches nothing at all. A muted output stays muted: swbr
+ * cannot tell deliberate silence from an accident, and unmuting someone's
+ * speakers is the worse mistake. Add `unmute` to alert_vol_set to override
+ * that. */
+static void alert_player_cmd(const Cell *e, char *out, size_t cap)
+{
+    if (e->alert_vol_min <= 0 || !*e->alert_vol_get || !*e->alert_vol_set) {
+        snprintf(out, cap, "%s", e->alert_play);
+        return;
+    }
+    char lo[16];
+    snprintf(lo, sizeof(lo), "%d", e->alert_vol_min);
+    char up[256], back[256];
+    const char *vmin[] = { lo }, *vold[] = { "$_v" };
+    expand_fmt(up,   sizeof(up),   e->alert_vol_set, "v", vmin);
+    expand_fmt(back, sizeof(back), e->alert_vol_set, "v", vold);
+    snprintf(out, cap,
+             "_v=$(%s 2>/dev/null | tr -cs '0-9' ' ' | awk '{print $1; exit}'); "
+             "case \"$_v\" in ''|*[!0-9]*) _v= ;; esac; "
+             "if [ -n \"$_v\" ] && [ \"$_v\" -lt %d ]; then "
+             "_back() { %s; }; trap _back EXIT INT TERM HUP; %s; fi; "
+             /* not exec: that replaces the shell and takes the EXIT trap with
+              * it, so the volume was raised and never put back */
+             "%s",
+             e->alert_vol_get, e->alert_vol_min, back, up, e->alert_play);
+}
+
+/* In the detached grandchild, so it cannot use msg_set: it goes back in
+ * through the bar's own fifo, the same way `swbr --msg` does. */
+static void alert_player_failed(const Cell *e, int status)
+{
+    char line[400];
+    if (status == -1)
+        snprintf(line, sizeof(line), "error: %s alert: cannot run '%s'",
+                 e->name, e->alert_play);
+    else
+        snprintf(line, sizeof(line), "error: %s alert: '%s' exited %d",
+                 e->name, e->alert_play, WIFEXITED(status) ? WEXITSTATUS(status) : status);
+    msg_send(line);
+}
+
 static void alert_play_tone(const Cell *e, int urgency)
 {
     if (e->alert_tone <= 0 || !*e->alert_play) return;
@@ -3010,8 +3070,10 @@ static void alert_play_tone(const Cell *e, int urgency)
 
     if (fork() > 0) _exit(0);                    /* orphan it, no zombie */
 
-    FILE *out = popen(e->alert_play, "w");
-    if (!out) _exit(0);
+    char player[1024];
+    alert_player_cmd(e, player, sizeof(player));
+    FILE *out = popen(player, "w");
+    if (!out) { alert_player_failed(e, -1); _exit(0); }
 
     const int rate = 44100;
     int ms = e->alert_ms > 0 ? e->alert_ms : 1050;
@@ -3022,15 +3084,16 @@ static void alert_play_tone(const Cell *e, int urgency)
     int n  = rate * ms / 1000;
     int edge = rate * 15 / 1000;                 /* 15 ms in and out */
     int gap = rate * 130 / 1000;
+    double gain = clampf((float)e->alert_gain / 100.0f, 0.02f, 1.0f);
 
     for (int b = 0; b < beeps; ++b) {
         for (int i = 0; i < n; ++i) {
             double env = 1.0;
             if (i < edge)          env = 0.5 - 0.5 * cos(M_PI * i / edge);
             else if (i > n - edge) env = 0.5 - 0.5 * cos(M_PI * (n - i) / edge);
-            double v = sin(2.0 * M_PI * e->alert_tone * i / rate) * env * 0.35;
+            double v = sin(2.0 * M_PI * e->alert_tone * i / rate) * env * gain;
             int16_t sm = (int16_t)(v * 32767.0);
-            fwrite(&sm, 2, 1, out);
+            if (fwrite(&sm, 2, 1, out) != 1) { b = beeps; break; }  /* it died */
             fwrite(&sm, 2, 1, out);              /* both ears */
         }
         if (b + 1 < beeps) {
@@ -3038,7 +3101,11 @@ static void alert_play_tone(const Cell *e, int urgency)
             for (int i = 0; i < gap; ++i) { fwrite(&z, 2, 1, out); fwrite(&z, 2, 1, out); }
         }
     }
-    pclose(out);
+    int st = pclose(out);
+    /* A tone nobody hears is indistinguishable from an alert that never
+     * fired, and the player's own error goes nowhere when the bar was started
+     * by sway. So say it on the bar. */
+    if (st != 0 && st != -1) alert_player_failed(e, st);
     _exit(0);
 }
 
@@ -5820,6 +5887,8 @@ static void usage(void)
 "                      keyboard grab, no fifo. For finding out which part of\n"
 "                      swbr a compositor is unhappy about\n"
 "  --probe             print outputs, sizes, font metrics and cell values\n"
+"  --alert-test [CELL]  fire a cell's alert here and now: the tone through\n"
+"                      its own player, and what alert_cmd would run\n"
 "  --slim              start folded (same as start_collapsed=1)\n"
 "  --toggle            fold or unfold the running bar. Also --fold/--unfold\n"
 "                      bindsym $mod+b exec swbr --toggle\n"
@@ -5925,7 +5994,9 @@ static void usage(void)
 "  NAME.alert=30,20,10,5   percentages that fire once on the way down and\n"
 "                      rearm on the way up. alert_msg= the text, alert_cmd=\n"
 "                      a command (%c is the percentage), alert_tone= Hz,\n"
-"                      alert_ms=, alert_beeps=, alert_play= the player\n"
+"                      alert_ms=, alert_beeps=, alert_play= the player,\n"
+"                      alert_gain=35 how loud the tone itself is, and\n"
+"                      alert_vol_min=0 a mixer floor just for the alert\n"
 "  NAME.hover_slim=0   1 = folded, resting on this cell opens the bar for as\n"
 "                      long as you stay on it\n"
 "  NAME.slim_color2=   second colour: the minutes of a clock cell, and its\n"
@@ -6063,6 +6134,7 @@ static void dump_config(void)
 /* ------------------------------------------------------------------ main */
 
 static int  probe = 0;
+static int  alert_test_arg = 0;   /* argv index of --alert-test */
 static int  do_replace = 0;
 static int  minimal = 0;
 static int  cfg_start_collapsed_arg = 0;
@@ -6243,6 +6315,82 @@ static void on_signal(int s)
     else sig_quit = 1;
 }
 
+/* `swbr --alert-test [cell]`: everything a level does except the command,
+ * printed and played here and now, so you find out whether the player works
+ * before the battery is flat. The command is only shown — a test that powers
+ * the machine off is not a test. */
+static int alert_test(const char *name)
+{
+    Cell *e = NULL;
+    for (int i = 0; i < cfg.cell_count; ++i) {
+        if (name && *name) { if (!strcmp(cfg.cell[i].name, name)) { e = &cfg.cell[i]; break; } }
+        else if (cfg.cell[i].alert_n) { e = &cfg.cell[i]; break; }
+    }
+    if (!e) { fprintf(stderr, "swbr: no cell '%s' with alert= set\n", name ? name : ""); return 1; }
+    if (!e->alert_n) { fprintf(stderr, "swbr: cell '%s' has no alert= levels\n", e->name); return 1; }
+    signal(SIGPIPE, SIG_IGN);     /* a player that dies must not kill the test */
+
+    printf("cell      %s\n", e->name);
+    printf("levels    ");
+    for (int i = 0; i < e->alert_n; ++i) printf("%d%s", e->alert_lv[i], i + 1 < e->alert_n ? "," : "\n");
+    printf("message   %s\n", *e->alert_msg ? e->alert_msg : "(none)");
+    printf("player    %s\n", *e->alert_play ? e->alert_play : "(none)");
+    printf("tone      %d Hz, %d ms, %d beeps%s, gain %d%%\n", e->alert_tone,
+           e->alert_ms, e->alert_beeps, e->alert_escalate ? ", escalating" : "",
+           e->alert_gain);
+    if (e->alert_vol_min > 0)
+        printf("volume    lifted to at least %d%% for the tone, then put back\n",
+               e->alert_vol_min);
+    else
+        puts("volume    the mixer is left alone (alert_vol_min=0)");
+
+    if (*e->alert_cmd) {
+        printf("\nalert_cmd runs at every level, and only at a level:\n");
+        for (int i = 0; i < e->alert_n; ++i) {
+            char buf[320], cs[16];
+            snprintf(cs, sizeof(cs), "%d", e->alert_lv[i]);
+            const char *vals[] = { cs };
+            expand_fmt(buf, sizeof(buf), e->alert_cmd, "c", vals);
+            printf("  %3d%%  sh -c \"%s\"\n", e->alert_lv[i], buf);
+        }
+        printf("  (not run by this test)\n");
+    }
+
+    if (e->alert_tone <= 0 || !*e->alert_play) { puts("\nno tone configured"); return 0; }
+
+    /* Straight to the player, in this process, so its own errors land on the
+     * terminal and the exit status is the answer. */
+    char player[1024];
+    alert_player_cmd(e, player, sizeof(player));
+    if (e->alert_vol_min > 0) printf("\nplayer    %s\n", player);
+
+    printf("\nplaying... ");
+    fflush(stdout);
+    FILE *out = popen(player, "w");
+    if (!out) { printf("cannot run it: %s\n", strerror(errno)); return 1; }
+    const int rate = 44100;
+    int n = rate * (e->alert_ms > 0 ? e->alert_ms : 1050) / 1000;
+    int edge = rate * 15 / 1000;
+    double gain = clampf((float)e->alert_gain / 100.0f, 0.02f, 1.0f);
+    for (int b = 0; b < (e->alert_beeps > 0 ? e->alert_beeps : 1); ++b) {
+        for (int i = 0; i < n; ++i) {
+            double env = 1.0;
+            if (i < edge) env = 0.5 - 0.5 * cos(M_PI * i / edge);
+            else if (i > n - edge) env = 0.5 - 0.5 * cos(M_PI * (n - i) / edge);
+            double v = sin(2.0 * M_PI * e->alert_tone * i / rate) * env * gain;
+            int16_t sm = (int16_t)(v * 32767.0);
+            if (fwrite(&sm, 2, 1, out) != 1) break;
+            fwrite(&sm, 2, 1, out);
+        }
+        if (ferror(out)) break;
+    }
+    int st = pclose(out);
+    if (st == 0) { puts("done."); return 0; }
+    printf("the player failed (exit %d). Heard nothing? That is why.\n",
+           WIFEXITED(st) ? WEXITSTATUS(st) : st);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     char cfgpath[PATH_MAX];
@@ -6258,6 +6406,7 @@ int main(int argc, char **argv)
             printf("SwBr %s (build %s)\n", SWBR_VERSION, SWBR_BUILD); return 0;
         } else if (!strcmp(argv[i], "--dump-config")) { dump_config(); return 0; }
         else if (!strcmp(argv[i], "--probe")) probe = 1;
+        else if (!strcmp(argv[i], "--alert-test")) alert_test_arg = i;
         else if (!strcmp(argv[i], "--replace")) do_replace = 1;
         else if (!strcmp(argv[i], "--minimal")) minimal = 1;
         else if (!strcmp(argv[i], "--slim") || !strcmp(argv[i], "--collapsed"))
@@ -6284,6 +6433,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {                 /* command line wins */
         const char *a = argv[i];
         if (!strcmp(a, "--config")) { i++; continue; }
+        if (!strcmp(a, "--alert-test")) { if (i + 1 < argc && argv[i+1][0] != '-') i++; continue; }
         if (!strcmp(a, "--probe") || !strcmp(a, "--slim") ||
             !strcmp(a, "--replace") || !strcmp(a, "--minimal") ||
             !strcmp(a, "--collapsed")) continue;
@@ -6301,6 +6451,12 @@ int main(int argc, char **argv)
         }
         *eq = 0;
         config_set(&cfg, trim(buf), trim(eq + 1));
+    }
+
+    if (alert_test_arg) {
+        const char *who = alert_test_arg + 1 < argc && argv[alert_test_arg + 1][0] != '-'
+                        ? argv[alert_test_arg + 1] : NULL;
+        return alert_test(who);
     }
 
     signal(SIGUSR1, on_signal);

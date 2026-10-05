@@ -285,7 +285,7 @@ battery.slim=bar
 battery.slim_w=56  # same again: wide enough to count the blocks
 
 # --- shouting when it is going flat -----------------------------------------
-battery.alert=30,20,10,5   # percentages. Each fires once on the way down and
+battery.alert=30,20,10,5,1 # percentages. Each fires once on the way down and
                    # rearms when the charge comes back above it, or when the
                    # cable goes in — no counter file, no repeats at 19%
 battery.alert_msg=BATTERY %c%%   # taken over the bar like any other message;
@@ -293,12 +293,34 @@ battery.alert_msg=BATTERY %c%%   # taken over the bar like any other message;
 battery.alert_tone=250     # Hz. A sine with soft edges, written straight to
 battery.alert_ms=1050       # the player — no click, unlike a test tone.
 battery.alert_beeps=2      # 0 Hz for silence
+battery.alert_gain=35      # how loud the tone itself is, percent of full
+                   # scale. Costs nothing and touches no mixer, so try this
+                   # before alert_vol_min below. 80 is loud but still clean
 battery.alert_play=aplay -q -f cd -
                    # on pipewire/pulse instead:
                    # paplay --raw --rate=44100 --format=s16le --channels=2
+
+# An alert nobody hears is not an alert. If the mixer is below this, swbr
+# raises it for the tone and puts it straight back — even if the alert is
+# killed half way through. ALSA has no per-stream level, so this is the master
+# control: music gets louder too, for the second or two the tone lasts.
+# 0 = never touch the mixer.
+battery.alert_vol_min=50
+battery.alert_vol_get=amixer -M get Master | grep -o '[0-9]*%' | head -1
+battery.alert_vol_set=amixer -M -q set Master %v%
+                   # any pair of commands works: the first prints a number,
+                   # the second takes %v. Your own alsa_control, pactl,
+                   # wpctl -- whatever you already use
+                   # A muted output stays muted: swbr cannot tell deliberate
+                   # silence from an accident. Append `unmute` to the set
+                   # command if you would rather it spoke anyway
 battery.alert_cmd=[ %c -le 1 ] && poweroff
-                   # run at every level; %c is the percentage, so guard it.
-                   # At one percent there is nothing left to warn about
+                   # run at every level, and ONLY at a level: the guard can
+                   # only ever be true if 1 is in the list above, which is why
+                   # it is. %c is the percentage. Check it works without
+                   # waiting for a flat battery:  swbr --alert-test
+                   # poweroff needs root — give your user a sudo rule for it,
+                   # or the command silently does nothing
 
 # --- folding ---------------------------------------------------------------
 # Put the pointer over the bar and press the key: the bar rolls up into a thin

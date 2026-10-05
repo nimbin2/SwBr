@@ -202,15 +202,42 @@ default.
 ## Going flat
 
 ```
-battery.alert=30,20,10,5
+battery.alert=30,20,10,5,1
 battery.alert_msg=BATTERY %c%%
 battery.alert_tone=250
+battery.alert_cmd=[ %c -le 1 ] && poweroff
 ```
 
 Each level fires once on the way down and rearms when the charge comes back
 above it, or when the cable goes in — so 19% does not nag every ten seconds.
 The message goes through the bar's own message system, as a warning except for
 the last level, which is an error.
+
+`alert_cmd` runs at every level and **only** at a level, so a guard like
+`[ %c -le 1 ]` needs `1` in the list — otherwise it is evaluated at 5% and
+never again. `poweroff` also needs root.
+
+`swbr --alert-test [CELL]` fires an alert now: it prints the levels, plays the
+tone through your own player and reports its exit status, and shows what
+`alert_cmd` would run at each level without running it. A player that fails
+during a real alert now says so on the bar instead of failing silently.
+
+`alert_gain` (35%) is how loud the tone itself is, which costs nothing and
+moves no mixer. When that is not enough, `alert_vol_min` raises the mixer for
+the tone and puts it back:
+
+```
+battery.alert_vol_min=50
+battery.alert_vol_get=amixer -M get Master | grep -o '[0-9]*%' | head -1
+battery.alert_vol_set=amixer -M -q set Master %v%
+```
+
+Any pair of commands works — the first prints a number, the second takes `%v`.
+The level is only raised if it is already below the floor, and the restore is
+the shell's own EXIT trap, so it happens even if the alert is killed part way
+through. ALSA has no per-stream volume, so this is the master control: other
+audio is louder for the second or two the tone lasts. A muted output stays
+muted; append `unmute` to the set command if you would rather it spoke anyway.
 
 The tone is a sine with a raised-cosine edge either side, written as raw PCM
 straight into `alert_play` (`aplay -q -f cd -` by default, or

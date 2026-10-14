@@ -1,0 +1,28 @@
+swbr: tint busy workspace buttons, and make a failed alert audible
+
+ws_cpu_wash=45 tints a workspace button in the load colour, more of it the
+busier the workspace is. The two-pixel dot column was the only sign before and
+was easy to miss across a whole screen; the dots stay as the scale, the tint
+is what the row says at a glance. The focused workspace keeps its own colour:
+that is a different question and must not become a matter of degree.
+
+Measured offscreen at 0.9 and 3.9 cores: a busy button's mean colour distance
+from the bar background goes from 22 to 85 and from 48 to 80, while idle
+buttons and the focused one are unchanged.
+
+Also in this release, from the battery alert work:
+
+- alert_gain (35%) sets the loudness of the generated tone, which moves no
+  mixer at all.
+- alert_vol_min raises the mixer for the tone and puts it back, through
+  alert_vol_get / alert_vol_set. The restore is the shell's own EXIT trap, so
+  it survives the alert being killed part way through. Not exec'ing the player
+  is load-bearing here: exec replaces the shell and takes the trap with it.
+- A player that fails during an alert now reports it on the bar. It used to
+  fail silently, because swbr is started by sway and its stderr goes nowhere.
+- swbr --alert-test fires an alert now, prints the levels, gain and mixer
+  floor, plays the tone and reports the player's exit status, and shows what
+  alert_cmd would run at each level without running it.
+- The shipped example contradicted itself: alert_cmd runs at a level and only
+  at a level, so the `[ %c -le 1 ] && poweroff` guard could never be true with
+  levels 30,20,10,5. The list is now 30,20,10,5,1.

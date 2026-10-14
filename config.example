@@ -32,6 +32,8 @@ refresh=0.25       # how often the bar may redraw, in seconds. Cell updates
 ws_names=1         # 1 = names, 0 = numbers only
 ws_other=1         # also the workspaces of your other monitors, as short pills
 ws_cpu=1           # a column of dots: how busy each workspace is, in cores
+ws_cpu_wash=45     # and a tint across the button, more of it the busier it
+                   # is. 0 = dots only
 ws_border=0        # 1 = a thin outline around every button. 0 = none, just
                    # the gap between them
 ws_slots=10        # always show the numbers 1..10, open or not; a free one

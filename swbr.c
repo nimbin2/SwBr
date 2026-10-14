@@ -1384,6 +1384,7 @@ typedef struct {
     int  ws_names, ws_pad, ws_gap, ws_min_w, ws_click, scroll_workspace, ws_inset;
     int  ws_border;              /* outline thickness in px, 0 = none        */
     int  ws_slots;               /* show this many numbers, used or not      */
+    int  ws_cpu_wash;            /* busy workspaces tinted this much, pct    */
     int  ws_empty_alpha;         /* how visible a free number is, percent    */
     int  slim_bar_segs;          /* folded gauges: this many segments, 0 = solid */
     int  slim_bar_gap;           /* px between those segments                */
@@ -1458,6 +1459,7 @@ static void config_defaults(Config *c)
     c->ws_inset = 0;
     c->ws_border = 0;            /* off: the bar looked busier, not clearer */
     c->ws_slots = 10;
+    c->ws_cpu_wash = 45;
     c->ws_empty_alpha = 35;
     c->slim_bar_segs = 10;
     c->slim_bar_gap = 2;
@@ -1757,6 +1759,7 @@ static void config_set(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "ws_inset")) c->ws_inset = atoi(v);
     else if (!strcmp(k, "ws_border")) c->ws_border = atoi(v);
     else if (!strcmp(k, "ws_slots")) c->ws_slots = atoi(v);
+    else if (!strcmp(k, "ws_cpu_wash")) c->ws_cpu_wash = atoi(v);
     else if (!strcmp(k, "ws_empty_alpha")) c->ws_empty_alpha = atoi(v);
     else if (!strcmp(k, "ws_click")) c->ws_click = atoi(v);
     else if (!strcmp(k, "ws_radius")) c->ws_radius = (float)atof(v);
@@ -4319,6 +4322,22 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
                          (float)cfg.ws_border * s,
                          col_scale_alpha(cfg.ws_border_col, bfade));
         }
+        /* A column of dots two pixels wide is easy to miss across a whole
+         * screen. The button itself is tinted in the load colour as well, more
+         * of it the busier the workspace, so which ones are working is the
+         * first thing the row says rather than something to go looking for.
+         * The focused one keeps its own colour: that is a different question
+         * and it must not become a matter of degree. */
+        Col lcol; float lfrac; bool lfaint;
+        bool busy = cpu_load_col(i, &lcol, &lfrac, &lfaint);
+        if (busy && cfg.ws_cpu_wash > 0 && !w->focused) {
+            Col wash = lcol;
+            float k = lfaint ? 0.18f : 0.35f + 0.65f * lfrac;
+            wash.a = (uint8_t)clampf((float)cfg.ws_cpu_wash * k * 2.55f, 0.0f, 255.0f);
+            pill(cv, x, by, bh, bwid, s, mine ? rad : rad * 0.6f,
+                 col_scale_alpha(wash, bfade));
+        }
+
         if (mine)
             text_draw(cv, f, x + (bwid - tw) * 0.5f, base,
                       col_scale_alpha(fg, fade), w->label);
@@ -4330,15 +4349,15 @@ static void ws_block_draw(Canvas *cv, Bar *b, Font *f, float x, float y0,
                       col_scale_alpha(fg, bfade * 0.72f), w->label);
         }
 
-        Col lc; float lf; bool faint;
-        if (cpu_load_col(i, &lc, &lf, &faint)) {
+        if (busy) {
             /* Up the right edge of the button, the same dots as the folded
-             * strip so the two read as one idea. */
+             * strip so the two read as one idea. They are the scale; the wash
+             * is the glance. */
             float dw  = clampf(2.0f * s, 1.0f, 3.0f);
             float pad = 3.0f * s;
             dot_column(cv, x + bwid - dw - pad, by + pad, dw, bh - 2.0f * pad,
-                       2.0f * s, 2.0f * s, faint ? 0.001f : lf,
-                       col_scale_alpha(lc, bfade));
+                       2.0f * s, 2.0f * s, lfaint ? 0.001f : lfrac,
+                       col_scale_alpha(lcol, bfade));
         }
 
         if (b->hits < MAX_WORKSPACES) {
@@ -5915,7 +5934,8 @@ static void usage(void)
 "\n"
 "workspaces\n"
 "  ws_names=0          0 = number only, 1 = the full workspace name\n"
-"  ws_pad=11 ws_gap=4 ws_min_w=0 ws_border=0\n""  ws_slots=10         show the numbers 1..n whether or not they exist\n""  ws_empty_alpha=35   how visible a free number is, percent\n"
+"  ws_pad=11 ws_gap=4 ws_min_w=0 ws_border=0\n""  ws_slots=10         show the numbers 1..n whether or not they exist\n"
+"  ws_cpu_wash=45      how much a busy workspace button is tinted, percent\n""  ws_empty_alpha=35   how visible a free number is, percent\n"
 "  ws_inset=0          gap above and below the buttons; >0 makes them pills\n"
 "  ws_radius=0         0 = square, the button spans the whole bar height\n"
 "                      -1 = a full pill when inset, else follows radius\n"
@@ -6072,10 +6092,10 @@ static void dump_config(void)
            c.min_width, c.align_x, (double)c.radius, c.outputs);
     printf("\n# --- workspaces ---\n");
     printf("ws_names=%d\nws_pad=%d\nws_gap=%d\nws_min_w=%d\nws_inset=%d\nws_radius=%g\n"
-           "ws_border=%d\nws_slots=%d\nws_empty_alpha=%d\n"
+           "ws_border=%d\nws_slots=%d\nws_empty_alpha=%d\nws_cpu_wash=%d\n"
            "ws_click=%d\nscroll_workspace=%d\nmode_show=%d\n",
            c.ws_names, c.ws_pad, c.ws_gap, c.ws_min_w, c.ws_inset, (double)c.ws_radius,
-           c.ws_border, c.ws_slots, c.ws_empty_alpha,
+           c.ws_border, c.ws_slots, c.ws_empty_alpha, c.ws_cpu_wash,
            c.ws_click, c.scroll_workspace, c.mode_show);
     printf("\n# --- text ---\n");
     printf("# font=\n# font_alt=\nui_scale=%g\ntext_px=%g\nws_px=%g\ntext_y=%g\n"

@@ -391,6 +391,11 @@ ws_other=1         # 1 = also show the workspaces of your other monitors, as
 ws_cpu=1           # a dot on each workspace button showing how much
                    # processor time the windows on it are using. Folded, the
                    # workspace slot fills from the bottom instead
+ws_cpu_wash=45     # and the whole button tinted in the same colour, up to
+                   # this much at full load: which workspaces are working is
+                   # then the first thing the row says, not something to go
+                   # looking for. 0 = dots only. The focused workspace keeps
+                   # its own colour whatever it is doing
 ws_cpu_interval=3  # seconds between samples
 # tree_min_s=5     # the load dots and source=window cells need sway's tree.
                    # It is fetched only when sway reports a change, and never

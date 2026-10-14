@@ -340,6 +340,7 @@ panels, and a `poweroff` at one percent. Either goes to
 | `outputs`, `ws_other` | which monitors get a bar, and whose workspaces show |
 | `ws_names`, `ws_inset`, `ws_radius`, `ws_border` | numbers or names, pills or blocks, outlined or not |
 | `ws_slots`, `ws_empty_alpha` | show every number, open or not, and how faint |
+| `ws_cpu`, `ws_cpu_wash` | how busy each workspace is: dots, and a tint |
 | `slim_ws_w`, `slim_bar_segs`, `slim_bar_gap` | folded slot width, gauge blocks |
 | `font`, `font_alt`, `ui_scale`, `text_px` | text |
 | `markup` | the pango subset: `<span foreground=..>`, `<b>`, `&amp;` |

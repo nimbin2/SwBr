@@ -1,28 +1,40 @@
-swbr: tint busy workspace buttons, and make a failed alert audible
+swbr: a vcam cell — lamps on the strip, a menu on a click
 
-ws_cpu_wash=45 tints a workspace button in the load colour, more of it the
-busier the workspace is. The two-pixel dot column was the only sign before and
-was easy to miss across a whole screen; the dots stay as the scale, the tint
-is what the row says at a glance. The focused workspace keeps its own colour:
-that is a different question and must not become a matter of degree.
+vcam is a virtual webcam: it loops the real camera through a filter and
+overlay chain and writes the result to a v4l2loopback device that browsers
+see as a camera. It listens on a unix socket and answers in lines.
 
-Measured offscreen at 0.9 and 3.9 cores: a busy button's mean colour distance
-from the bar background goes from 22 to 85 and from 48 to 80, while idle
-buttons and the focused one are unchanged.
+source=vcam asks that socket itself, the way source=cmus asks cmus, rather
+than running vcam-ctl on a timer — so whether it is up, what it is sharing
+and whether it is recording are facts rather than a guess at what a script
+printed. One connection a tick gets `list` and `record info`, non-blocking,
+on the tick the bar already has: a wedged vcam must not take the bar with
+it. The cell is not there at all while vcam is not running.
 
-Also in this release, from the battery alert work:
+Folded, a new slim mode: dots. Round lamps, one per thing that is on —
+green while vcam runs, a second red one while it is recording. slim_color2
+changes the red one.
 
-- alert_gain (35%) sets the loudness of the generated tone, which moves no
-  mixer at all.
-- alert_vol_min raises the mixer for the tone and puts it back, through
-  alert_vol_get / alert_vol_set. The restore is the shell's own EXIT trap, so
-  it survives the alert being killed part way through. Not exec'ing the player
-  is load-bearing here: exec replaces the shell and takes the trap with it.
-- A player that fails during an alert now reports it on the bar. It used to
-  fail silently, because swbr is started by sway and its stderr goes nowhere.
-- swbr --alert-test fires an alert now, prints the levels, gain and mixer
-  floor, plays the tone and reports the player's exit status, and shows what
-  alert_cmd would run at each level without running it.
-- The shipped example contradicted itself: alert_cmd runs at a level and only
-  at a level, so the `[ %c -le 1 ] && poweroff` guard could never be true with
-  levels 30,20,10,5. The list is now 30,20,10,5,1.
+Clicking the cell opens a menu in the panel under the bar — the same strip
+of surface the calendar lives in, which already grows and already takes
+clicks. The rows are built from what vcam just said, so only what makes
+sense is offered: share a region, share a monitor by name (from sway's own
+output list), stop sharing when something is, show or hide the webcam
+overlay, move it on round the six positions, start or stop recording. A row
+lights up under the pointer, and the menu stays open while you work through
+it, because setting a share up is several of these in a row.
+
+Doing is not asking: the menu runs vcam-ctl. Picking a region needs slurp
+and sharing a whole monitor needs geometry and down-scaling it already gets
+right. src_path= finds it when it is not on $PATH.
+
+Also fixed, found on the way: a height change the resize throttle turned
+away was turned away for good. tip_h had already moved, so the caller never
+asked again and the panel stayed invisible — which is why a menu with seven
+rows would not open where one with five had. The bar remembers the refused
+fit and asks again next frame.
+
+The build id now covers sw_theme.h as well as swbr.c.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SuAfijAAYjLpcVwhCq3AF4

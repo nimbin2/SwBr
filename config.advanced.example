@@ -67,6 +67,21 @@ pad_right=20       # padding at the right end, so the last cell can breathe
 scroll_speed=45    # text cells: logical px per second while hovered
 scroll_pause=900   # ms held at each end before scrolling
 
+#
+#   NAME.source=vcam   vcam, the virtual webcam. swbr asks its socket itself
+#                      (/tmp/vcam.sock, or $VCAM_SOCK), so whether it is up,
+#                      what it is sharing and whether it is recording are
+#                      facts rather than a guess at what a script printed.
+#                      The cell disappears while vcam is not running.
+#                      Folded it is lamps: green for running, a second red
+#                      one while it is recording.
+#                      Clicking it opens a menu — share a region, share a
+#                      monitor by name, stop sharing, show or hide the
+#                      webcam overlay and move it round the frame, start or
+#                      stop recording. What it offers is what makes sense
+#                      for the state it is in.
+#   NAME.src_path=     where vcam-ctl is, if it is not on $PATH. The menu
+#                      runs it for the doing; the socket is only for asking.
 # ---------------------------------------------------------------------------
 # CELLS — the right hand side
 #
@@ -93,12 +108,14 @@ scroll_pause=900   # ms held at each end before scrolling
 #                      to the next one: equal bg colours merge into one box
 #   NAME.pad=0         padding inside the cell, left and right
 #   NAME.slim=auto     folded strip: auto | tick | bar | clock | presence |
-#                      off. presence = a plain block in the running colour,
-#                      present only while the program is
+#                      dots | off. presence = a plain block in the running
+#                      colour, present only while the program is.
+#                      dots = one round lamp per thing that is on
 #   NAME.slim_color=   override this cell's colour on the strip. Without it
 #                      the strip reuses the colour the cell's own text has,
 #                      so a cyan clock stays cyan when folded
-#   NAME.slim_color2=  second colour: the minutes of a clock cell
+#   NAME.slim_color2=  second colour: the minutes of a clock cell, or the
+#                      recording lamp of a source=vcam cell (default red)
 #   NAME.slim_min=0    the value range a gauge maps, so a temperature or a
 #   NAME.slim_max=100  load average can be a gauge as well as a percent
 #   NAME.markup=1      the output may use <span foreground="#rrggbb">..</span>

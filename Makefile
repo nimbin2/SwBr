@@ -7,9 +7,10 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
 LDLIBS   = -lwayland-client -lm
 
-# short md5 of the source, compiled in: `swbr --version` then tells you
-# exactly which build is running
-BUILD   := $(shell md5sum swbr.c 2>/dev/null | cut -c1-8)
+# short md5 of the sources, compiled in: `swbr --version` then tells you
+# exactly which build is running. The headers count too, so a fix in one of
+# them is a different build even when swbr.c has not moved.
+BUILD   := $(shell cat swbr.c sw_theme.h 2>/dev/null | md5sum | cut -c1-8)
 
 all: swbr
 

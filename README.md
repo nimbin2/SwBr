@@ -90,6 +90,40 @@ word — `%c%i %w %h` gives `83- 21.5W 1.7h`.
 `mpv [3|5]`. Matched against the app id, the X11 class, then the title.
 `src_fmt`: `%n` the cell's name, `%w` the workspaces, `%c` the count.
 
+**vcam** is the virtual webcam that loops your camera through a filter and
+overlay chain. swbr asks its socket — `/tmp/vcam.sock`, or `$VCAM_SOCK` —
+rather than running `vcam-ctl` on a timer, so whether it is up, what it is
+sharing and whether it is recording are facts. The cell is not there at all
+while vcam is not running.
+
+```
+cell=vcam
+vcam.source=vcam
+vcam.slim_color=#4ADE80
+```
+
+Folded it is lamps: green for running, a second red one while it is
+recording. `slim_color2=` changes the red one.
+
+Clicking it opens a menu in the panel under the bar:
+
+| Row | |
+|---|---|
+| share a region… | pick it with slurp |
+| share screen DP-1 | one row per monitor, named from sway |
+| stop sharing | only while something is shared |
+| show the webcam / webcam off | the webcam overlay on top of the share |
+| webcam: top right → bottom right | moves it on, round the six positions |
+| record the loopback / stop recording | |
+
+Only the rows that make sense for the state it is in are offered. The menu
+stays open while you work through it, because setting a share up is usually
+several of these in a row.
+
+The menu runs `vcam-ctl` for the doing — picking a region needs slurp, and
+sharing a whole monitor needs geometry and down-scaling it already gets
+right. `src_path=` points at it if it is not on `$PATH`.
+
 ## Folded
 
 `space` over the bar folds it to a few pixels.

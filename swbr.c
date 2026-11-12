@@ -3,6 +3,8 @@
  * Sits on top of the tiled windows at the screen edge, does not steal space
  * from them. Hover it and press space to fold it into a thin signal strip.
  *
+ * Written/modified by: Claude Opus 4.1, Claude Sonnet 4.5, Claude Opus 5
+ *
  * Dependencies:
  *   - libwayland-client   (the only library you link)
  *   - stb_truetype.h      (vendored single-header — smooth fonts)
@@ -71,7 +73,7 @@
 #include "sw_theme.h"
 
 #define APP_ID          "swbr"
-#define SWBR_VERSION  "0.11.0"
+#define SWBR_VERSION  "0.12.0"
 #ifndef SWBR_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWBR_BUILD "unknown"
 #endif
@@ -82,7 +84,7 @@
 #define MAX_CELLS       24
 
 enum { SLIM_AUTO, SLIM_TICK, SLIM_BAR, SLIM_CLOCK, SLIM_PRESENCE,
-       SLIM_MEDIA, SLIM_OFF };
+       SLIM_MEDIA, SLIM_DOTS, SLIM_OFF };
 
 /* ------------------------------------------------------------------ util */
 
@@ -1311,7 +1313,7 @@ static void cpu_sample(void)
  * `NAME.source=cmus` is the exception: swbr runs cmus-remote itself and reads
  * the answer, so whether something is playing is a fact rather than a guess
  * at what a script happened to print. */
-enum { SRC_CMD, SRC_CMUS, SRC_BATTERY, SRC_WINDOW };
+enum { SRC_CMD, SRC_CMUS, SRC_BATTERY, SRC_WINDOW, SRC_VCAM };
 enum { PS_UNKNOWN = -1, PS_STOPPED = 0, PS_PAUSED = 1, PS_PLAYING = 2 };
 typedef struct {
     char  name[32];
@@ -1667,6 +1669,14 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
             if (!e->interval) e->interval = 20;
             if (e->slim == SLIM_AUTO) e->slim = SLIM_BAR;
             if (e->slim_max <= e->slim_min) { e->slim_min = 0; e->slim_max = 100; }
+        } else if (!strcasecmp(v, "vcam")) {
+            e->source = SRC_VCAM;
+            /* it asks the socket, so there is nothing to run */
+            e->cmd[0] = 0;
+            if (!e->interval) e->interval = 2;
+            if (e->slim == SLIM_AUTO) e->slim = SLIM_DOTS;
+            if (!e->hide_empty) e->hide_empty = 1;   /* gone while vcam is */
+            e->hover_click = 1;                      /* the menu, on a click */
         } else {
             e->source = SRC_CMD;
         }
@@ -1693,6 +1703,7 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
         else if (!strcasecmp(v, "presence") || !strcasecmp(v, "running") ||
                  !strcasecmp(v, "app")) e->slim = SLIM_PRESENCE;
         else if (!strcasecmp(v, "media") || !strcasecmp(v, "play")) e->slim = SLIM_MEDIA;
+        else if (!strcasecmp(v, "dots") || !strcasecmp(v, "dot")) e->slim = SLIM_DOTS;
         else if (!strcasecmp(v, "off") || !strcmp(v, "0")) e->slim = SLIM_OFF;
         else e->slim = SLIM_AUTO;
     }
@@ -2964,6 +2975,352 @@ static void window_scan(const JV *node, const char *want, const char *ws,
     }
 }
 
+/* ----------------------------------------------------------------- vcam
+ *
+ * vcam is a virtual webcam: it reads the real camera, composites overlays —
+ * images, looping video, live screen regions, the webcam itself — and writes
+ * the result to a v4l2loopback device that browsers see as a camera. It
+ * listens on a unix socket and answers in lines.
+ *
+ * swbr asks it directly rather than running vcam-ctl on a timer, for the same
+ * reason it asks cmus itself: whether vcam is up, what it is sharing and
+ * whether it is recording are then facts, not a guess at what a script
+ * printed. Reading is non-blocking and rides the tick the bar already has —
+ * a hung vcam must not take the bar down with it.
+ *
+ * Doing is different from asking. The menu shells out to vcam-ctl, because
+ * picking a region needs slurp and sharing a whole monitor needs geometry
+ * and down-scaling that vcam-ctl already gets right.
+ */
+
+#define VCAM_MAX_OVL 16
+
+typedef struct {
+    char kind[8];               /* img | vid | webcam | screen */
+    char id[32];
+    int  x, y, w, h;
+} VcamOvl;
+
+typedef struct {
+    bool     running;           /* the socket answered */
+    bool     recording;
+    char     rec_file[160];
+    VcamOvl  ovl[VCAM_MAX_OVL];
+    int      n;
+    int      screens;           /* how many of them are screen captures */
+    int      cam;               /* index of the first webcam overlay, or -1 */
+    uint32_t at;                /* when this was last believed */
+} VcamState;
+
+static VcamState VCAM;      /* zeroed; VCAM.cam is fixed up at startup */
+
+static struct {
+    int      fd;                /* -1 when nothing is in flight */
+    char     buf[4096];
+    size_t   len;
+    uint32_t began;
+} vcam_io = { -1, {0}, 0, 0 };
+
+static const char *vcam_sock_path(void)
+{
+    const char *e = getenv("VCAM_SOCK");
+    return (e && *e) ? e : "/tmp/vcam.sock";
+}
+
+static void vcam_io_close(void)
+{
+    if (vcam_io.fd >= 0) close(vcam_io.fd);
+    vcam_io.fd  = -1;
+    vcam_io.len = 0;
+}
+
+/* Ask for everything in one connection: vcam-ctl's own protocol is "write
+   your commands, write quit, read until the far end closes". */
+static void vcam_ask(void)
+{
+    struct sockaddr_un a;
+    const char *req = "list\nrecord info\nquit\n";
+    int fd;
+
+    if (vcam_io.fd >= 0) return;                  /* one in flight is enough */
+
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    str_set(a.sun_path, sizeof(a.sun_path), vcam_sock_path());
+
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) < 0 && errno != EINPROGRESS) {
+        close(fd);
+        VCAM.running   = false;                   /* nothing is listening */
+        VCAM.recording = false;
+        VCAM.n = VCAM.screens = 0;
+        VCAM.cam = -1;
+        VCAM.at = now_ms();
+        return;
+    }
+    /* A unix socket connects at once, so the write goes now. If the far end
+       is mid-accept this short write can still block in the kernel's sense;
+       it is 22 bytes into an empty buffer, so it does not. */
+    if (write(fd, req, strlen(req)) < 0) { close(fd); return; }
+
+    vcam_io.fd    = fd;
+    vcam_io.len   = 0;
+    vcam_io.began = now_ms();
+}
+
+/* One line of `list`: OK 0: [screen] id=screen pos=(0,0) size=1280x720 (top) */
+static void vcam_parse_line(const char *ln)
+{
+    const char *p;
+    VcamOvl o;
+
+    if (!strncmp(ln, "OK recording", 12)) {
+        VCAM.recording = true;
+        p = strstr(ln, "file=");
+        if (p) str_set(VCAM.rec_file, sizeof(VCAM.rec_file), p + 5);
+        return;
+    }
+    if (!strcmp(ln, "OK stopped") || !strcmp(ln, "OK already stopped")) {
+        VCAM.recording  = false;
+        VCAM.rec_file[0] = 0;
+        return;
+    }
+    p = strchr(ln, '[');
+    if (!p || VCAM.n >= VCAM_MAX_OVL) return;
+
+    memset(&o, 0, sizeof o);
+    if (sscanf(p, "[%7[^]]] id=%31s pos=(%d,%d) size=%dx%d",
+               o.kind, o.id, &o.x, &o.y, &o.w, &o.h) < 6) return;
+
+    if (!strcmp(o.kind, "screen")) VCAM.screens++;
+    else if (!strcmp(o.kind, "webcam") && VCAM.cam < 0) VCAM.cam = VCAM.n;
+    VCAM.ovl[VCAM.n++] = o;
+}
+
+static void vcam_parse(void)
+{
+    char *p = vcam_io.buf, *nl;
+
+    VCAM.running   = true;
+    VCAM.recording = false;
+    VCAM.n = VCAM.screens = 0;
+    VCAM.cam = -1;
+    VCAM.at  = now_ms();
+
+    vcam_io.buf[vcam_io.len] = 0;
+    while ((nl = strchr(p, '\n')) != NULL) {
+        *nl = 0;
+        while (*p == ' ') p++;
+        if (*p) vcam_parse_line(p);
+        p = nl + 1;
+    }
+    if (*p) vcam_parse_line(p);
+}
+
+/* Called when the socket says something, and on the tick to time it out. */
+static void vcam_pump(void)
+{
+    if (vcam_io.fd < 0) return;
+
+    for (;;) {
+        size_t space = sizeof(vcam_io.buf) - 1;
+        ssize_t r;
+        space = vcam_io.len < space ? space - vcam_io.len : 0;
+        if (space == 0) break;                     /* said more than we asked */
+        r = read(vcam_io.fd, vcam_io.buf + vcam_io.len, space);
+        if (r > 0) {
+            vcam_io.len += (size_t)r;
+            continue;
+        }
+        if (r == 0) {                              /* it said quit and closed */
+            vcam_parse();
+            vcam_io_close();
+            return;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (now_ms() - vcam_io.began > 2000) { /* wedged: drop it */
+                vcam_io_close();
+                VCAM.running = false;
+            }
+            return;
+        }
+        if (errno == EINTR) continue;
+        vcam_io_close();                           /* connect refused, mostly */
+        VCAM.running = false;
+        VCAM.at = now_ms();
+        return;
+    }
+    vcam_parse();
+    vcam_io_close();
+}
+
+static int vcam_poll_fd(void) { return vcam_io.fd; }
+
+/* ---------------------------------------------------------- the vcam menu
+ *
+ * The panel that drops out of the bar already knows how to be a block of
+ * text with its own clickable bits — that is what the calendar is. A menu is
+ * the same shape: one line a row, each with something to run. The rows are
+ * built from what vcam just said, so what is offered is what makes sense:
+ * no "stop sharing" when nothing is shared, no webcam position when there is
+ * no webcam on screen.
+ */
+
+#define VCAM_MENU_MAX 14
+
+/* The monitors, which live further down with the rest of the Wayland side. */
+static int         bar_output_count(void);
+static const char *bar_output_name(int i);
+
+typedef struct {
+    char label[72];
+    char cmd[256];              /* empty: a heading, not a row to press */
+} VcamRow;
+
+static VcamRow VMENU[VCAM_MENU_MAX];
+static int     VMENU_N;
+
+static const char *VCAM_POS[] = { "tr", "br", "bl", "tl", "center", "full" };
+static const char *VCAM_POS_SAY[] = { "top right", "bottom right", "bottom left",
+                                      "top left", "centre", "full frame" };
+
+/* Where the webcam overlay sits now, as an index into VCAM_POS. The overlay
+   only knows its pixels, so this reads them back: which half of the frame
+   each edge is nearer. Unknown comes out as top right, which is where
+   `vcam-ctl webcam` puts one by default. */
+static int vcam_cam_pos(void)
+{
+    const VcamOvl *o;
+    int cx, cy;
+    if (VCAM.cam < 0) return 0;
+    o = &VCAM.ovl[VCAM.cam];
+    if (o->x <= 2 && o->y <= 2 && o->w >= 640) return 5;      /* full frame */
+    cx = o->x + o->w / 2;
+    cy = o->y + o->h / 2;
+    /* the output is whatever vcam runs at; the overlay's own box is the only
+       scale we have, so judge against four of its widths across */
+    {
+        int fw = o->w * 4, fh = o->h * 4;
+        if (cx > fw / 3 && cx < fw * 2 / 3 && cy > fh / 3 && cy < fh * 2 / 3) return 4;
+        if (cy < fh / 2) return cx < fw / 2 ? 3 : 0;
+        return cx < fw / 2 ? 2 : 1;
+    }
+}
+
+static void vmenu_add(const char *label, const char *fmt, ...)
+{
+    VcamRow *r;
+    if (VMENU_N >= VCAM_MENU_MAX) return;
+    r = &VMENU[VMENU_N++];
+    str_set(r->label, sizeof(r->label), label);
+    r->cmd[0] = 0;
+    if (fmt) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(r->cmd, sizeof(r->cmd), fmt, ap);
+        va_end(ap);
+    }
+}
+
+static const char *vcam_ctl(Cell *e)
+{
+    return *e->src_path ? e->src_path : "vcam-ctl";
+}
+
+/* Build the rows, and the text the panel is sized and drawn from. */
+static void vcam_menu_build(Cell *e)
+{
+    char out[1024];
+    size_t o = 0;
+    const char *ctl = vcam_ctl(e);
+    char hl[16];
+
+    VMENU_N = 0;
+    snprintf(hl, sizeof(hl), "%02x%02x%02x", cfg.hl.r, cfg.hl.g, cfg.hl.b);
+
+    if (!VCAM.running) {
+        vmenu_add("vcam is not running", NULL);
+        str_set(e->out_hover, sizeof(e->out_hover), VMENU[0].label);
+        return;
+    }
+
+    /* what it is doing, as a heading */
+    {
+        char head[72];
+        if (VCAM.screens > 0 && VCAM.cam >= 0)
+            snprintf(head, sizeof(head), "sharing %d · webcam on", VCAM.screens);
+        else if (VCAM.screens > 0)
+            snprintf(head, sizeof(head), "sharing %d", VCAM.screens);
+        else
+            snprintf(head, sizeof(head), "idle");
+        vmenu_add(head, NULL);
+    }
+
+    vmenu_add("share a region\xe2\x80\xa6", "%s screen", ctl);
+    for (int i = 0; i < bar_output_count() && VMENU_N < VCAM_MENU_MAX - 4; ++i) {
+        const char *nm = bar_output_name(i);
+        char lbl[72];
+        if (!nm) continue;
+        snprintf(lbl, sizeof(lbl), "share screen %s", nm);
+        vmenu_add(lbl, "%s screen --full --monitor %s", ctl, nm);
+    }
+    if (VCAM.screens > 0)
+        vmenu_add("stop sharing", "%s screen --remove-all", ctl);
+
+    if (VCAM.cam >= 0) {
+        char lbl[72];
+        int pos = vcam_cam_pos();
+        int next = (pos + 1) % (int)(sizeof(VCAM_POS) / sizeof(VCAM_POS[0]));
+        vmenu_add("webcam off", "%s webcam off", ctl);
+        snprintf(lbl, sizeof(lbl), "webcam: %s \xe2\x86\x92 %s",
+                 VCAM_POS_SAY[pos], VCAM_POS_SAY[next]);
+        vmenu_add(lbl, "%s webcam %s", ctl, VCAM_POS[next]);
+    } else {
+        vmenu_add("show the webcam", "%s webcam tr", ctl);
+    }
+
+    if (VCAM.recording) vmenu_add("stop recording", "%s record stop", ctl);
+    else                vmenu_add("record the loopback", "%s record start", ctl);
+
+    for (int i = 0; i < VMENU_N; ++i) {
+        const char *sep = i + 1 < VMENU_N ? "\n" : "";
+        if (!*VMENU[i].cmd)          /* the heading, in the accent colour */
+            o += (size_t)snprintf(out + o, sizeof(out) - o,
+                                  "<span foreground=\"%s\">%s</span>%s",
+                                  hl, VMENU[i].label, sep);
+        else
+            o += (size_t)snprintf(out + o, sizeof(out) - o, "%s%s",
+                                  VMENU[i].label, sep);
+        if (o >= sizeof(out) - 80) break;
+    }
+    str_set(e->out_hover, sizeof(e->out_hover), out);
+}
+
+static bool cell_is_menu(const Cell *e) { return e->source == SRC_VCAM; }
+
+
+
+/* What the cell says in the full bar. Short on purpose: the detail lives in
+   the menu, and a bar is not the place for a sentence. */
+static void vcam_read(Cell *e)
+{
+    e->state = VCAM.running ? PS_PLAYING : PS_STOPPED;
+    if (!VCAM.running) { e->out[0] = 0; return; }
+
+    if (VCAM.screens > 0 && VCAM.cam >= 0)
+        snprintf(e->out, sizeof(e->out), "%s share+cam", e->name);
+    else if (VCAM.screens > 0)
+        snprintf(e->out, sizeof(e->out), "%s share", e->name);
+    else
+        snprintf(e->out, sizeof(e->out), "%s", e->name);
+
+    if (VCAM.recording) {
+        size_t n = strlen(e->out);
+        snprintf(e->out + n, sizeof(e->out) - n, " rec");
+    }
+}
+
 static void window_read(Cell *e)
 {
     e->out[0] = 0;
@@ -3247,6 +3604,7 @@ static void cell_finish(Cell *e)
     if (e->source == SRC_CMUS)    { cmus_parse(e);  e->len = 0; return; }
     if (e->source == SRC_BATTERY) { battery_read(e); e->len = 0; return; }
     if (e->source == SRC_WINDOW)  { window_read(e);  e->len = 0; return; }
+    if (e->source == SRC_VCAM)    { vcam_read(e);    e->len = 0; return; }
 
     char *t = trim(e->buf);
     for (char *q = t; *q; ++q) if (*q == '\n' || *q == '\r' || *q == '\t') *q = ' ';
@@ -3310,9 +3668,11 @@ static void cells_tick(void)
         if (e->interval == 0 && e->next_run) continue;       /* run once */
         if (e->next_run && (int32_t)(t - e->next_run) < 0) continue;
 
-        if ((e->source == SRC_BATTERY || e->source == SRC_WINDOW) && !*e->cmd) {
-            if (e->source == SRC_WINDOW) window_read(e);   /* no process */
-            else                         battery_read(e);
+        if ((e->source == SRC_BATTERY || e->source == SRC_WINDOW ||
+             e->source == SRC_VCAM) && !*e->cmd) {
+            if (e->source == SRC_WINDOW)    window_read(e);   /* no process */
+            else if (e->source == SRC_VCAM) { vcam_ask(); vcam_read(e); }
+            else                            battery_read(e);
             e->next_run = t + (uint32_t)(e->interval > 0 ? e->interval * 1000 : 5000);
             cells_dirty = true;
             continue;
@@ -3464,6 +3824,11 @@ struct Bar {
     uint32_t last_commit;       /* ...and when we last committed a frame     */
     int  last_slot;             /* the buffer currently on screen            */
     float cal_x0, cal_x1, cal_x2, cal_x3, cal_y0, cal_y1;  /* the ‹ › boxes */
+    /* one box a menu row, taken as the panel is painted */
+    struct { float x0, x1, y0, y1; } mrow[VCAM_MENU_MAX];
+    int   mrows;
+    int   mhot;                 /* the row under the pointer, or -1 */
+    bool  fit_want;             /* a height change the throttle turned away */
     int  tip_h;                 /* extra surface for the hover text, logical */
     int  tip_cell;              /* which cell it belongs to, or -1          */
     float cellx0[MAX_CELLS], cellx1[MAX_CELLS];  /* where each cell sat in the
@@ -3492,6 +3857,14 @@ static struct zwlr_layer_shell_v1 *layer_shell;
 
 static Output outputs[MAX_OUTPUTS];
 static int    output_count = 0;
+
+static int bar_output_count(void) { return output_count; }
+static const char *bar_output_name(int i)
+{
+    if (i < 0 || i >= output_count) return NULL;
+    if (!outputs[i].alive || !*outputs[i].name) return NULL;
+    return outputs[i].name;
+}
 static Bar   *pointer_bar = NULL;
 static bool   running = true;
 
@@ -3671,6 +4044,15 @@ static int slim_mode(Cell *e)
     return SLIM_TICK;
 }
 
+/* A dots cell shows one block per thing that is on. vcam is the only source
+   with more than one: the first dot says it is running, the second that it is
+   recording — two states worth seeing at a glance from a folded bar. */
+static int slim_dot_count(Cell *e)
+{
+    if (e->source == SRC_VCAM) return VCAM.running ? (VCAM.recording ? 2 : 1) : 0;
+    return *e->out ? 1 : 0;
+}
+
 static float slim_width_of(Cell *e, int mode, float s)
 {
     if (e && e->slim_w > 0) return (float)e->slim_w * s;
@@ -3678,6 +4060,10 @@ static float slim_width_of(Cell *e, int mode, float s)
     case SLIM_CLOCK: return 12.0f * 3.0f * s + 11.0f * 2.0f * s;
     case SLIM_BAR:   return 40.0f * s;
     case SLIM_PRESENCE: return 10.0f * s;
+    case SLIM_DOTS: {
+        int n = slim_dot_count(e);
+        return n > 0 ? (float)n * 10.0f * s + (float)(n - 1) * 3.0f * s : 0.0f;
+    }
     case SLIM_MEDIA: return 26.0f * s;
     case SLIM_OFF:   return 0.0f;
     default:         return 12.0f * s;
@@ -3688,6 +4074,11 @@ static float slim_width_of(Cell *e, int mode, float s)
 /* The colour a cell shows on the strip: its own slim_color, else the colour
  * it painted its own text with, so folding never changes what a thing looks
  * like. A cyan clock stays cyan. */
+/* The recording dot is the one thing on the strip that should not take the
+   cell's colour: a camera that is recording wants saying in red, whatever
+   colour the cell is. slim_color2 overrides it. */
+static Col slim_dot_color(Cell *e, int i);
+
 static Col slim_color_of(Cell *e)
 {
     if (e->has_slim_color) return e->slim_color;
@@ -3704,6 +4095,15 @@ static Col slim_color_of(Cell *e)
             if (rs.v[i].has_fg) return rs.v[i].fg;
     }
     return base;
+}
+
+static Col slim_dot_color(Cell *e, int i)
+{
+    if (e->source == SRC_VCAM && i == 1) {
+        Col red = { 0xE0, 0x3A, 0x3A, 0xFF };
+        return e->has_slim_color2 ? e->slim_color2 : red;
+    }
+    return slim_color_of(e);
 }
 
 /* +, an up arrow or a bolt mean charging; -, a down arrow mean draining;
@@ -3758,6 +4158,16 @@ static void slim_draw_one(Canvas *cv, Cell *e, int mode, float x, float y,
                           float w, float h, float s)
 {
     Col c = slim_color_of(e);
+    if (mode == SLIM_DOTS) {
+        /* round, so they read as lamps rather than as another gauge */
+        int n = slim_dot_count(e);
+        float d = h, gap = 3.0f * s;
+        float step = d + gap;
+        for (int i = 0; i < n; ++i)
+            fill_round(cv, x + (float)i * step, y, d, d,
+                       d * 0.5f, d * 0.5f, d * 0.5f, d * 0.5f, slim_dot_color(e, i));
+        return;
+    }
     if (mode == SLIM_PRESENCE) {
         /* the cell only exists while its program does, so a block here means
          * "that one is up". It keeps the colour it has in the full bar —
@@ -4768,8 +5178,16 @@ static void bar_fit_height(Bar *b)
      * real width — and want_w is still zero until the width has been fitted
      * once, which since it stopped fitting during animations is exactly when
      * a fold would ask for a new height. */
+    /* Resizes are throttled, and a dropped one used to be dropped for good:
+       tip_h had already changed, so the caller never asked again and the
+       panel stayed invisible. Remember it and come back next frame. */
     uint32_t now = now_ms();
-    if (b->last_fit && (int32_t)(now - b->last_fit) < 100) return;
+    if (b->last_fit && (int32_t)(now - b->last_fit) < 100) {
+        b->fit_want = true;
+        b->dirty = true;
+        return;
+    }
+    b->fit_want = false;
     b->last_fit = now;
     wl_count.resize++;
 
@@ -4919,9 +5337,11 @@ static const char *bar_tip_text(Bar *b)
         if (b->px < b->chit[i].x0 - slack || b->px >= b->chit[i].x1 + slack) continue;
         Cell *e = &cfg.cell[b->chit[i].cell];
         if (e->hover_click) return NULL;               /* it waits for a click */
-        if (!e->out_hover[0] && !*e->hover_cmd && !e->hover_cal) return NULL;
+        if (!e->out_hover[0] && !*e->hover_cmd && !e->hover_cal && !cell_is_menu(e))
+            return NULL;
         if (b->tip_showing != b->chit[i].cell) {
-            if (e->hover_cal)        { e->cal_off = 0; hover_cal_build(e); }
+            if (cell_is_menu(e))     vcam_menu_build(e);
+            else if (e->hover_cal)   { e->cal_off = 0; hover_cal_build(e); }
             else if (*e->hover_cmd)  hover_cmd_run(e);
         }
         if (!e->out_hover[0]) return NULL;
@@ -5057,9 +5477,28 @@ static void bar_paint_tip(Bar *b, Canvas *cv, Font *f, float s, bool top,
                         col_scale_alpha(cfg.bg, e));
 
     bool cal = !b->tip_msg && cfg.cell[b->tip_cell].hover_cal != 0;
+    bool menu = !b->tip_msg && cell_is_menu(&cfg.cell[b->tip_cell]);
     float row = (th - 8.0f * s) / (float)(nlines > 0 ? nlines : 1);
+
+    if (menu) { b->mrows = 0; b->mhot = -1; }
+
     for (int i = 0; i < nlines; ++i) {
         float ly = ty + 4.0f * s + (float)i * row;
+        if (menu && i < VMENU_N && b->mrows < VCAM_MENU_MAX) {
+            int k = b->mrows++;
+            b->mrow[k].x0 = bx / s;  b->mrow[k].x1 = (bx + pw) / s;
+            b->mrow[k].y0 = ly / s;  b->mrow[k].y1 = (ly + row) / s;
+            /* a row lights up under the pointer, so it is obvious the panel
+               is something to press rather than something to read */
+            if (*VMENU[i].cmd &&
+                b->px >= b->mrow[k].x0 && b->px < b->mrow[k].x1 &&
+                b->py >= b->mrow[k].y0 && b->py < b->mrow[k].y1) {
+                b->mhot = k;
+                fill_round(cv, bx + 3.0f * s, ly, pw - 6.0f * s, row,
+                           4.0f * s, 4.0f * s, 4.0f * s, 4.0f * s,
+                           col_scale_alpha(cfg.hl, 0.22f * e));
+            }
+        }
         float base = baseline_for(f, ly, row, s);
         float x = bx + pad;
         if (cal && i == 0) {                     /* the month sits centred
@@ -5155,6 +5594,7 @@ static void bar_paint(Bar *b, Canvas *cv, float visL, float s)
     const char *tiptxt = fade > 0.01f ? bar_tip_text(b) : NULL;
     int want_tip = tiptxt ? bar_tip_height(b, tiptxt) : 0;
     if (want_tip != b->tip_h) { b->tip_h = want_tip; bar_fit_height(b); }
+    else if (b->fit_want)     bar_fit_height(b);
     if (tiptxt && b->tip_showing != b->tip_cell) b->tip_at = now_ms();
     b->tip_showing = tiptxt ? b->tip_cell : -1;
 
@@ -5643,6 +6083,27 @@ static void ws_switch(const char *name)
     sway_cmd("workspace --no-auto-back-and-forth \"%s\"", esc);
 }
 
+/* a menu row, if that is what was clicked */
+static bool menu_click(Bar *b, int button)
+{
+    if (button != 1 || b->tip_showing < 0 || b->mrows <= 0) return false;
+    if (!cell_is_menu(&cfg.cell[b->tip_showing])) return false;
+
+    for (int i = 0; i < b->mrows && i < VMENU_N; ++i) {
+        if (b->px < b->mrow[i].x0 || b->px >= b->mrow[i].x1) continue;
+        if (b->py < b->mrow[i].y0 || b->py >= b->mrow[i].y1) continue;
+        if (!*VMENU[i].cmd) return true;          /* the heading: swallow it */
+        run_command(VMENU[i].cmd);
+        /* Ask again shortly: vcam needs a moment to act, and the menu is
+           built from what it says. The panel stays open, because setting a
+           screen up is several of these in a row. */
+        cfg.cell[b->tip_showing].next_run = now_ms() + 400;
+        b->dirty = true;
+        return true;
+    }
+    return false;
+}
+
 /* the calendar arrows, if that is what was clicked */
 static bool cal_click(Bar *b, int button)
 {
@@ -5665,6 +6126,7 @@ static bool cal_click(Bar *b, int button)
 
 static void bar_click(Bar *b, int button)
 {
+    if (menu_click(b, button)) return;
     if (cal_click(b, button)) return;
 
     /* opening and closing a click-panel, before anything else the click
@@ -5678,7 +6140,8 @@ static void bar_click(Bar *b, int button)
             Cell *e = &cfg.cell[on];
             if (b->tip_pinned == on) b->tip_pinned = -1;   /* clicked again */
             else {
-                if (e->hover_cal)       { e->cal_off = 0; hover_cal_build(e); }
+                if (cell_is_menu(e))    vcam_menu_build(e);
+                else if (e->hover_cal)  { e->cal_off = 0; hover_cal_build(e); }
                 else if (*e->hover_cmd) hover_cmd_run(e);
                 b->tip_pinned = e->out_hover[0] ? on : -1;
             }
@@ -5987,6 +6450,7 @@ static void usage(void)
 "                      | media | off. presence = a block in the running\n"
 "                      colour, there only while the program is. media = two\n"
 "                      bars while playing, one dim one when not\n"
+"  NAME.slim=dots      round lamps on the strip, one per thing that is on\n"
 "  NAME.slim_color=    override this cell's colour on the strip. Without it\n"
 "                      the strip reuses the colour the cell's own text has\n"
 "  NAME.source=window  asks sway which workspaces have a window of\n"
@@ -5998,6 +6462,13 @@ static void usage(void)
 "                      particular one, NAME.src_fmt= lays it out (%c capacity,\n"
 "                      %i sign, %s the word). NAME.cmd= goes back to your own\n"
 "                      command for any of this\n"
+"  NAME.source=vcam    the virtual webcam. swbr asks its socket itself\n"
+"                      (/tmp/vcam.sock, or $VCAM_SOCK), so running, sharing\n"
+"                      and recording are facts. Gone while vcam is. Folded\n"
+"                      it is lamps: green running, a second red one while\n"
+"                      recording. Click it for a menu: share a region or a\n"
+"                      monitor, stop sharing, show and move the webcam\n"
+"                      overlay, record. NAME.src_path= finds vcam-ctl\n"
 "  NAME.source=cmus    swbr runs cmus-remote itself: playing and paused are\n"
 "                      read from it rather than guessed from the text, and\n"
 "                      the command, interval, slim=media and the mouse binds\n"
@@ -6257,7 +6728,18 @@ static void probe_report(void)
             printf("            %-12s %5.2f cores\n", cpu_ws_name[i], cpu_ws_cores[i]);
     }
     static const char *SLIM_NAME[] = { "auto", "tick", "bar", "clock",
-                                       "presence", "media", "off" };
+                                       "presence", "media", "dots", "off" };
+    for (int i = 0; i < cfg.cell_count; ++i)
+        if (cfg.cell[i].source == SRC_VCAM) {      /* give it its moment */
+            vcam_ask();
+            for (int k = 0; k < 40 && vcam_poll_fd() >= 0; ++k) {
+                struct timespec ts = { 0, 5 * 1000 * 1000 };
+                nanosleep(&ts, NULL);
+                vcam_pump();
+            }
+            vcam_read(&cfg.cell[i]);
+        }
+
     for (int i = 0; i < cfg.cell_count; ++i) {
         Cell *e = &cfg.cell[i];
         printf("cell %-10s iv=%-3d min_w=%-4d sep=%d  '%s'\n",
@@ -6298,6 +6780,7 @@ static void probe_report(void)
         const char *mn = m == SLIM_BAR ? "gauge" : m == SLIM_CLOCK ? "clock"
                        : m == SLIM_OFF ? "off"
                        : m == SLIM_PRESENCE ? "up"
+                       : m == SLIM_DOTS ? "dots"
                        : m == SLIM_MEDIA ? "media" : "tick";
         printf("  %-10s %-5s %3.0fpx %02x%02x%02x", e->name, mn,
                (double)slim_width_of(e, m, 1.0f), c.r, c.g, c.b);
@@ -6617,7 +7100,7 @@ int main(int argc, char **argv)
         while (wl_display_prepare_read(dpy) != 0) wl_display_dispatch_pending(dpy);
         wl_display_flush(dpy);
 
-        struct pollfd pfd[4 + MAX_CELLS];
+        struct pollfd pfd[5 + MAX_CELLS];
         int n = 0;
         pfd[n].fd = wlfd;        pfd[n].events = POLLIN; n++;
         pfd[n].fd = sway_evt_fd; pfd[n].events = POLLIN; n++;
@@ -6625,6 +7108,8 @@ int main(int argc, char **argv)
         if (msg_fd >= 0) { pfd[n].fd = msg_fd; pfd[n].events = POLLIN; n++; }
         for (int i = 0; i < cfg.cell_count; ++i)
             if (cfg.cell[i].fd >= 0) { pfd[n].fd = cfg.cell[i].fd; pfd[n].events = POLLIN; n++; }
+        int vfd = vcam_poll_fd();
+        if (vfd >= 0) { pfd[n].fd = vfd; pfd[n].events = POLLIN; n++; }
 
         bool any_dirty = false;
         for (int i = 0; i < output_count; ++i)
@@ -6639,8 +7124,30 @@ int main(int argc, char **argv)
             timeout = 100;
         else if (status_fd < 0 && *cfg.status_command) timeout = 100;
 
+        if (vfd >= 0 && timeout > 16) timeout = 16;   /* a reply is on its way */
+
         int pr = poll(pfd, (nfds_t)n, timeout);
         if (pr < 0 && errno != EINTR) { wl_display_cancel_read(dpy); break; }
+
+        if (vcam_poll_fd() >= 0) {
+            unsigned before = (unsigned)VCAM.running | ((unsigned)VCAM.recording << 1)
+                            | ((unsigned)VCAM.screens << 2) | ((unsigned)(VCAM.cam >= 0) << 10);
+            vcam_pump();
+            if (vcam_poll_fd() < 0) {
+                unsigned after = (unsigned)VCAM.running | ((unsigned)VCAM.recording << 1)
+                               | ((unsigned)VCAM.screens << 2) | ((unsigned)(VCAM.cam >= 0) << 10);
+                if (after != before) {
+                    cells_dirty = true;
+                    /* an open menu is a picture of that state: redraw it */
+                    for (int i = 0; i < output_count; ++i) {
+                        Bar *vb = outputs[i].bar;
+                        if (!vb || vb->tip_showing < 0) continue;
+                        if (cell_is_menu(&cfg.cell[vb->tip_showing]))
+                            vcam_menu_build(&cfg.cell[vb->tip_showing]);
+                    }
+                }
+            }
+        }
 
         if (pfd[0].revents & POLLIN) {
             if (wl_display_read_events(dpy) < 0) break;

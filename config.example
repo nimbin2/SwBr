@@ -96,6 +96,16 @@ mpv.source=window
 mpv.program=mpv        # prints  mpv [3|5]
 mpv.slim=presence
 
+# --- vcam, the virtual webcam -----------------------------------------------
+# Shows up only while vcam is running. Folded it is a green lamp, with a
+# second red one while it is recording. Click it for the menu: share a
+# screen, show the webcam over it, move it, record.
+# Remember to name it in bar= as well, or it has nowhere to go.
+#
+# cell=vcam
+# vcam.source=vcam
+# vcam.slim_color=#4ADE80
+
 # --- where everything goes --------------------------------------------------
 # || splits left / center / right, ',' separates, (a,b) glues two together.
 # Keep this last.

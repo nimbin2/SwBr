@@ -91,10 +91,23 @@ word — `%c%i %w %h` gives `83- 21.5W 1.7h`.
 `src_fmt`: `%n` the cell's name, `%w` the workspaces, `%c` the count.
 
 **vcam** is the virtual webcam that loops your camera through a filter and
-overlay chain. swbr asks its socket — `/tmp/vcam.sock`, or `$VCAM_SOCK` —
-rather than running `vcam-ctl` on a timer, so whether it is up, what it is
-sharing and whether it is recording are facts. The cell is not there at all
-while vcam is not running.
+overlay chain. swbr asks its socket — `sock=`, else `$VCAM_SOCK`, else
+`/tmp/vcam.sock` — rather than running `vcam-ctl` on a timer, so whether it
+is up, what it is sharing and whether it is recording are facts. The cell is
+not there at all while vcam is not running: no empty box, nothing.
+
+If it never appears, `swbr --probe` says which socket it tried and what the
+answer was:
+
+```
+vcam socket /tmp/vcam.sock -> answered
+     2 overlay(s), 1 shared, webcam on, recording
+```
+
+`Connection refused` means nothing is listening there, `No such file or
+directory` the wrong path, `Permission denied` the wrong user — vcam makes
+its socket `0600`, so swbr has to run as whoever runs vcam. `SW_DEBUG_VCAM=1`
+says the same thing on every poll.
 
 ```
 cell=vcam
@@ -109,16 +122,21 @@ Clicking it opens a menu in the panel under the bar:
 
 | Row | |
 |---|---|
-| share a region… | pick it with slurp |
-| share screen DP-1 | one row per monitor, named from sway |
-| stop sharing | only while something is shared |
+| share a region… / stop sharing the region | pick it with slurp |
+| share screen DP-1 / stop sharing DP-1 | one row per monitor, named from sway |
+| stop sharing everything | only for shares none of those rows covers |
 | show the webcam / webcam off | the webcam overlay on top of the share |
 | webcam: top right → bottom right | moves it on, round the six positions |
 | record the loopback / stop recording | |
 
-Only the rows that make sense for the state it is in are offered. The menu
-stays open while you work through it, because setting a share up is usually
-several of these in a row.
+Each row is a toggle: a share swbr started gets an overlay id of its own —
+the monitor's name, or `region` — so the row that started it is the row that
+stops it. Only what makes sense for the state it is in is offered.
+
+The menu stays open and follows along while you work through it, because
+setting a share up is usually several of these in a row: press the position
+row five times and the webcam walks round the frame, the label saying where
+it is and where it is going next.
 
 The menu runs `vcam-ctl` for the doing — picking a region needs slurp, and
 sharing a whole monitor needs geometry and down-scaling it already gets

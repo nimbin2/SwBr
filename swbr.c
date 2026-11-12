@@ -73,7 +73,7 @@
 #include "sw_theme.h"
 
 #define APP_ID          "swbr"
-#define SWBR_VERSION  "0.12.0"
+#define SWBR_VERSION  "0.12.3"
 #ifndef SWBR_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWBR_BUILD "unknown"
 #endif
@@ -1325,6 +1325,7 @@ typedef struct {
     int   source;                /* SRC_CMD, or a player swbr knows itself   */
     char  src_fmt[128];          /* how a known player is laid out           */
     char  src_path[256];         /* where to read it from, when that varies  */
+    char  sock[128];             /* source=vcam: its socket, if not the usual */
     char  hover_fmt[192];        /* what to show while the pointer is on it  */
     char  hover_cmd[256];        /* ...or the output of this, run on hover   */
     int   hover_cal;             /* ...or a month, with today marked         */
@@ -1718,6 +1719,7 @@ static void cell_set(Config *c, const char *name, const char *k, const char *v)
     else if (!strcmp(k, "scroll") || !strcmp(k, "text")) e->scroll = atoi(v);
     else if (!strcmp(k, "sep") || !strcmp(k, "separator")) e->sep = atoi(v);
     else if (!strcmp(k, "hide_empty")) e->hide_empty = atoi(v);
+    else if (!strcmp(k, "sock")) str_set(e->sock, sizeof(e->sock), v);
     else if (!strcmp(k, "markup")) e->markup = atoi(v);
     else if (!strncmp(k, "button", 6) && isdigit((unsigned char)k[6]) && !k[7]) {
         int b = k[6] - '0';
@@ -3014,59 +3016,110 @@ typedef struct {
 
 static VcamState VCAM;      /* zeroed; VCAM.cam is fixed up at startup */
 
+enum { VC_IDLE, VC_CONNECTING, VC_WRITING, VC_READING };
+
 static struct {
     int      fd;                /* -1 when nothing is in flight */
+    int      phase;
+    size_t   sent;              /* of the request */
     char     buf[4096];
     size_t   len;
     uint32_t began;
-} vcam_io = { -1, {0}, 0, 0 };
+    char     why[192];          /* what went wrong last time, for --probe */
+} vcam_io = { -1, VC_IDLE, 0, {0}, 0, 0, "" };
+
+static int vcam_dbg(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SW_DEBUG_VCAM");
+        on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return on;
+}
+
+static void vcam_note(const char *what)
+{
+    str_set(vcam_io.why, sizeof(vcam_io.why), what);
+    if (vcam_dbg()) fprintf(stderr, "swbr: vcam %s\n", what);
+}
+
+/* The cell's own sock= wins, then $VCAM_SOCK, then where vcam puts it. */
+static char VCAM_SOCK_SET[128];
 
 static const char *vcam_sock_path(void)
 {
-    const char *e = getenv("VCAM_SOCK");
+    const char *e;
+    if (VCAM_SOCK_SET[0]) return VCAM_SOCK_SET;
+    e = getenv("VCAM_SOCK");
     return (e && *e) ? e : "/tmp/vcam.sock";
 }
 
 static void vcam_io_close(void)
 {
     if (vcam_io.fd >= 0) close(vcam_io.fd);
-    vcam_io.fd  = -1;
-    vcam_io.len = 0;
+    vcam_io.fd    = -1;
+    vcam_io.phase = VC_IDLE;
+    vcam_io.len   = 0;
+    vcam_io.sent  = 0;
+}
+
+static void vcam_down(const char *why)
+{
+    VCAM.running   = false;
+    VCAM.recording = false;
+    VCAM.n = VCAM.screens = 0;
+    VCAM.cam = -1;
+    VCAM.at  = now_ms();
+    vcam_note(why);
 }
 
 /* Ask for everything in one connection: vcam-ctl's own protocol is "write
    your commands, write quit, read until the far end closes". */
+static const char VCAM_REQ[] = "list\nrecord info\nquit\n";
+
 static void vcam_ask(void)
 {
     struct sockaddr_un a;
-    const char *req = "list\nrecord info\nquit\n";
     int fd;
 
     if (vcam_io.fd >= 0) return;                  /* one in flight is enough */
 
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) return;
+    if (fd < 0) { vcam_down("no socket"); return; }
     memset(&a, 0, sizeof a);
     a.sun_family = AF_UNIX;
     str_set(a.sun_path, sizeof(a.sun_path), vcam_sock_path());
 
-    if (connect(fd, (struct sockaddr *)&a, sizeof a) < 0 && errno != EINPROGRESS) {
-        close(fd);
-        VCAM.running   = false;                   /* nothing is listening */
-        VCAM.recording = false;
-        VCAM.n = VCAM.screens = 0;
-        VCAM.cam = -1;
-        VCAM.at = now_ms();
-        return;
-    }
-    /* A unix socket connects at once, so the write goes now. If the far end
-       is mid-accept this short write can still block in the kernel's sense;
-       it is 22 bytes into an empty buffer, so it does not. */
-    if (write(fd, req, strlen(req)) < 0) { close(fd); return; }
-
     vcam_io.fd    = fd;
     vcam_io.len   = 0;
+    vcam_io.sent  = 0;
     vcam_io.began = now_ms();
+
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+        vcam_io.phase = VC_WRITING;               /* the usual case */
+        return;
+    }
+    /* A unix socket normally connects inside connect(). It does not when the
+       far end has not got round to accepting — a vcam busy with frames, which
+       is every vcam — and then this is EINPROGRESS or EAGAIN and the socket
+       is not writable yet. Writing anyway fails, and throwing the connection
+       away on that is what left the cell empty against a vcam that was up
+       the whole time. Wait for it instead. */
+    if (errno == EINPROGRESS || errno == EALREADY || errno == EAGAIN
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+        || errno == EWOULDBLOCK
+#endif
+       ) {
+        vcam_io.phase = VC_CONNECTING;
+        return;
+    }
+    {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "%s: %s", vcam_sock_path(), strerror(errno));
+        vcam_io_close();
+        vcam_down(msg);
+    }
 }
 
 /* One line of `list`: OK 0: [screen] id=screen pos=(0,0) size=1280x720 (top) */
@@ -3107,6 +3160,7 @@ static void vcam_parse(void)
     VCAM.n = VCAM.screens = 0;
     VCAM.cam = -1;
     VCAM.at  = now_ms();
+    vcam_note("answered");
 
     vcam_io.buf[vcam_io.len] = 0;
     while ((nl = strchr(p, '\n')) != NULL) {
@@ -3118,10 +3172,50 @@ static void vcam_parse(void)
     if (*p) vcam_parse_line(p);
 }
 
-/* Called when the socket says something, and on the tick to time it out. */
+/* Called whenever the socket may have moved on, and on the tick to time it
+   out. Connect, write the request, read until the far end closes. */
 static void vcam_pump(void)
 {
     if (vcam_io.fd < 0) return;
+
+    if (now_ms() - vcam_io.began > 2000) {        /* wedged: drop it */
+        vcam_io_close();
+        vcam_down("timed out");
+        return;
+    }
+
+    if (vcam_io.phase == VC_CONNECTING) {
+        int err = 0;
+        socklen_t n = sizeof err;
+        if (getsockopt(vcam_io.fd, SOL_SOCKET, SO_ERROR, &err, &n) < 0) {
+            vcam_io_close();
+            vcam_down("getsockopt failed");
+            return;
+        }
+        if (err == EINPROGRESS || err == EALREADY) return;   /* still trying */
+        if (err) {
+            char msg[192];
+            snprintf(msg, sizeof(msg), "%s: %s", vcam_sock_path(), strerror(err));
+            vcam_io_close();
+            vcam_down(msg);
+            return;
+        }
+        vcam_io.phase = VC_WRITING;
+    }
+
+    if (vcam_io.phase == VC_WRITING) {
+        while (vcam_io.sent < sizeof(VCAM_REQ) - 1) {
+            ssize_t w = write(vcam_io.fd, VCAM_REQ + vcam_io.sent,
+                              sizeof(VCAM_REQ) - 1 - vcam_io.sent);
+            if (w > 0) { vcam_io.sent += (size_t)w; continue; }
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+            if (w < 0 && errno == EINTR) continue;
+            vcam_io_close();
+            vcam_down("write failed");
+            return;
+        }
+        vcam_io.phase = VC_READING;
+    }
 
     for (;;) {
         size_t space = sizeof(vcam_io.buf) - 1;
@@ -3138,17 +3232,10 @@ static void vcam_pump(void)
             vcam_io_close();
             return;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (now_ms() - vcam_io.began > 2000) { /* wedged: drop it */
-                vcam_io_close();
-                VCAM.running = false;
-            }
-            return;
-        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
         if (errno == EINTR) continue;
-        vcam_io_close();                           /* connect refused, mostly */
-        VCAM.running = false;
-        VCAM.at = now_ms();
+        vcam_io_close();
+        vcam_down(strerror(errno));
         return;
     }
     vcam_parse();
@@ -3156,6 +3243,20 @@ static void vcam_pump(void)
 }
 
 static int vcam_poll_fd(void) { return vcam_io.fd; }
+
+/* Everything the cell and the menu are drawn from, as one string: a cheap
+   way to notice a change that matters, including an overlay that only moved. */
+static void vcam_digest(char *out, size_t cap)
+{
+    size_t o = 0;
+    o += (size_t)snprintf(out + o, cap - o, "%d%d",
+                          (int)VCAM.running, (int)VCAM.recording);
+    for (int i = 0; i < VCAM.n && o < cap - 40; ++i)
+        o += (size_t)snprintf(out + o, cap - o, "|%s:%s:%d,%d,%d,%d",
+                              VCAM.ovl[i].kind, VCAM.ovl[i].id,
+                              VCAM.ovl[i].x, VCAM.ovl[i].y,
+                              VCAM.ovl[i].w, VCAM.ovl[i].h);
+}
 
 /* ---------------------------------------------------------- the vcam menu
  *
@@ -3208,6 +3309,15 @@ static int vcam_cam_pos(void)
     }
 }
 
+/* an overlay by id, or -1 */
+static int vcam_ovl_find(const char *id)
+{
+    if (!id || !*id) return -1;
+    for (int i = 0; i < VCAM.n; ++i)
+        if (!strcmp(VCAM.ovl[i].id, id)) return i;
+    return -1;
+}
+
 static void vmenu_add(const char *label, const char *fmt, ...)
 {
     VcamRow *r;
@@ -3257,16 +3367,43 @@ static void vcam_menu_build(Cell *e)
         vmenu_add(head, NULL);
     }
 
-    vmenu_add("share a region\xe2\x80\xa6", "%s screen", ctl);
+    /* Each share is a toggle. Sharing something gives the overlay an id of
+       our own — the monitor's name, or "region" — so this can tell which of
+       these rows is the one already running and offer to stop that one
+       rather than starting a second of it. */
+    if (vcam_ovl_find("region") >= 0)
+        vmenu_add("stop sharing the region", "%s screen --remove region", ctl);
+    else
+        vmenu_add("share a region\xe2\x80\xa6", "%s screen -i region", ctl);
+
     for (int i = 0; i < bar_output_count() && VMENU_N < VCAM_MENU_MAX - 4; ++i) {
         const char *nm = bar_output_name(i);
         char lbl[72];
         if (!nm) continue;
-        snprintf(lbl, sizeof(lbl), "share screen %s", nm);
-        vmenu_add(lbl, "%s screen --full --monitor %s", ctl, nm);
+        if (vcam_ovl_find(nm) >= 0) {
+            snprintf(lbl, sizeof(lbl), "stop sharing %s", nm);
+            vmenu_add(lbl, "%s screen --remove %s", ctl, nm);
+        } else {
+            snprintf(lbl, sizeof(lbl), "share screen %s", nm);
+            vmenu_add(lbl, "%s screen --full --monitor %s -i %s", ctl, nm, nm);
+        }
     }
-    if (VCAM.screens > 0)
-        vmenu_add("stop sharing", "%s screen --remove-all", ctl);
+
+    /* Anything shared that none of those rows covers — started from the
+       command line, or a second region — gets one row to stop the lot. */
+    {
+        int ours = 0;
+        for (int i = 0; i < VCAM.n; ++i) {
+            if (strcmp(VCAM.ovl[i].kind, "screen")) continue;
+            if (!strcmp(VCAM.ovl[i].id, "region")) { ours++; continue; }
+            for (int k = 0; k < bar_output_count(); ++k) {
+                const char *nm = bar_output_name(k);
+                if (nm && !strcmp(VCAM.ovl[i].id, nm)) { ours++; break; }
+            }
+        }
+        if (VCAM.screens > ours)
+            vmenu_add("stop sharing everything", "%s screen --remove-all", ctl);
+    }
 
     if (VCAM.cam >= 0) {
         char lbl[72];
@@ -3671,7 +3808,11 @@ static void cells_tick(void)
         if ((e->source == SRC_BATTERY || e->source == SRC_WINDOW ||
              e->source == SRC_VCAM) && !*e->cmd) {
             if (e->source == SRC_WINDOW)    window_read(e);   /* no process */
-            else if (e->source == SRC_VCAM) { vcam_ask(); vcam_read(e); }
+            else if (e->source == SRC_VCAM) {
+                str_set(VCAM_SOCK_SET, sizeof(VCAM_SOCK_SET), e->sock);
+                vcam_ask();
+                vcam_read(e);
+            }
             else                            battery_read(e);
             e->next_run = t + (uint32_t)(e->interval > 0 ? e->interval * 1000 : 5000);
             cells_dirty = true;
@@ -3748,6 +3889,10 @@ static bool cell_is_msg(Cell *e)
 static bool cell_visible(Cell *e)
 {
     if (cell_is_msg(e)) return true;
+    /* Nothing to say and nothing to manage: an empty box in the bar is worse
+       than no box. hide_empty does this for a command cell, but only if it
+       was asked to; for vcam it is the whole point of the cell. */
+    if (e->source == SRC_VCAM && !*e->out) return false;
     if (!*e->cmd && !*e->fmt && !*e->empty && e->source == SRC_CMD) return false;
     if (*e->out) return true;
     return *e->empty || !e->hide_empty;      /* a placeholder stays clickable */
@@ -6097,7 +6242,7 @@ static bool menu_click(Bar *b, int button)
         /* Ask again shortly: vcam needs a moment to act, and the menu is
            built from what it says. The panel stays open, because setting a
            screen up is several of these in a row. */
-        cfg.cell[b->tip_showing].next_run = now_ms() + 400;
+        cfg.cell[b->tip_showing].next_run = now_ms() + 200;
         b->dirty = true;
         return true;
     }
@@ -6463,7 +6608,8 @@ static void usage(void)
 "                      %i sign, %s the word). NAME.cmd= goes back to your own\n"
 "                      command for any of this\n"
 "  NAME.source=vcam    the virtual webcam. swbr asks its socket itself\n"
-"                      (/tmp/vcam.sock, or $VCAM_SOCK), so running, sharing\n"
+"                      (NAME.sock=, else $VCAM_SOCK, else /tmp/vcam.sock),\n"
+"                      so running, sharing\n"
 "                      and recording are facts. Gone while vcam is. Folded\n"
 "                      it is lamps: green running, a second red one while\n"
 "                      recording. Click it for a menu: share a region or a\n"
@@ -6731,13 +6877,20 @@ static void probe_report(void)
                                        "presence", "media", "dots", "off" };
     for (int i = 0; i < cfg.cell_count; ++i)
         if (cfg.cell[i].source == SRC_VCAM) {      /* give it its moment */
+            str_set(VCAM_SOCK_SET, sizeof(VCAM_SOCK_SET), cfg.cell[i].sock);
             vcam_ask();
-            for (int k = 0; k < 40 && vcam_poll_fd() >= 0; ++k) {
+            for (int k = 0; k < 60 && vcam_poll_fd() >= 0; ++k) {
                 struct timespec ts = { 0, 5 * 1000 * 1000 };
                 nanosleep(&ts, NULL);
                 vcam_pump();
             }
             vcam_read(&cfg.cell[i]);
+            printf("vcam socket %s -> %s\n", vcam_sock_path(),
+                   *vcam_io.why ? vcam_io.why : "no answer");
+            if (VCAM.running)
+                printf("     %d overlay(s), %d shared, webcam %s, %s\n",
+                       VCAM.n, VCAM.screens, VCAM.cam >= 0 ? "on" : "off",
+                       VCAM.recording ? "recording" : "not recording");
         }
 
     for (int i = 0; i < cfg.cell_count; ++i) {
@@ -7109,7 +7262,11 @@ int main(int argc, char **argv)
         for (int i = 0; i < cfg.cell_count; ++i)
             if (cfg.cell[i].fd >= 0) { pfd[n].fd = cfg.cell[i].fd; pfd[n].events = POLLIN; n++; }
         int vfd = vcam_poll_fd();
-        if (vfd >= 0) { pfd[n].fd = vfd; pfd[n].events = POLLIN; n++; }
+        if (vfd >= 0) {
+            pfd[n].fd = vfd;
+            pfd[n].events = vcam_io.phase == VC_READING ? POLLIN : POLLOUT;
+            n++;
+        }
 
         bool any_dirty = false;
         for (int i = 0; i < output_count; ++i)
@@ -7130,20 +7287,26 @@ int main(int argc, char **argv)
         if (pr < 0 && errno != EINTR) { wl_display_cancel_read(dpy); break; }
 
         if (vcam_poll_fd() >= 0) {
-            unsigned before = (unsigned)VCAM.running | ((unsigned)VCAM.recording << 1)
-                            | ((unsigned)VCAM.screens << 2) | ((unsigned)(VCAM.cam >= 0) << 10);
+            bool was_up = VCAM.running;
+            char before[160];
+            vcam_digest(before, sizeof before);
             vcam_pump();
             if (vcam_poll_fd() < 0) {
-                unsigned after = (unsigned)VCAM.running | ((unsigned)VCAM.recording << 1)
-                               | ((unsigned)VCAM.screens << 2) | ((unsigned)(VCAM.cam >= 0) << 10);
-                if (after != before) {
+                char after[160];
+                vcam_digest(after, sizeof after);
+                if (strcmp(before, after) != 0 || was_up != VCAM.running) {
                     cells_dirty = true;
-                    /* an open menu is a picture of that state: redraw it */
+                    /* An open menu is a picture of that state, down to where
+                       the webcam is sitting — rebuild it, or cycling the
+                       position shows the same two places for ever and the
+                       second press sends the command the first one did. */
                     for (int i = 0; i < output_count; ++i) {
                         Bar *vb = outputs[i].bar;
                         if (!vb || vb->tip_showing < 0) continue;
-                        if (cell_is_menu(&cfg.cell[vb->tip_showing]))
+                        if (cell_is_menu(&cfg.cell[vb->tip_showing])) {
                             vcam_menu_build(&cfg.cell[vb->tip_showing]);
+                            vb->dirty = true;
+                        }
                     }
                 }
             }

@@ -80,6 +80,9 @@ scroll_pause=900   # ms held at each end before scrolling
 #                      webcam overlay and move it round the frame, start or
 #                      stop recording. What it offers is what makes sense
 #                      for the state it is in.
+#   NAME.sock=         vcam's socket, if it is not $VCAM_SOCK or the usual
+#                      /tmp/vcam.sock. `swbr --probe` prints the one it
+#                      tried and what came back.
 #   NAME.src_path=     where vcam-ctl is, if it is not on $PATH. The menu
 #                      runs it for the doing; the socket is only for asking.
 # ---------------------------------------------------------------------------
@@ -223,6 +226,24 @@ mpv.src_fmt=<span foreground="#19cb00">%n </span><span foreground="#3E98E7">[%w]
 mpv.interval=3
 mpv.slim=presence      # same for mpv: started something in the background?
 mpv.slim_color=3ea6ff  # its own colour, so you can tell the two apart
+
+# --- vcam, the virtual webcam ----------------------------------------------
+# Only there while vcam is: no vcam, no cell, not even an empty box. swbr
+# asks vcam's own socket, so running / sharing / recording are facts rather
+# than a guess at what a script printed.
+cell=vcam
+vcam.source=vcam   # /tmp/vcam.sock, or $VCAM_SOCK, or vcam.sock= below.
+                   # `swbr --probe` prints the one it tried and the answer
+# vcam.sock=/tmp/vcam.sock       # if yours is somewhere else
+# vcam.src_path=vcam-ctl         # if it is not on $PATH
+vcam.color=60A5FA        # blue, so it reads as its own thing beside the
+                   # green of docker and the cyan of the clock
+vcam.slim_color=60A5FA   # the running lamp on the folded strip
+vcam.slim_color2=E03A3A  # the recording one beside it, red whatever the cell is
+                   # Clicking the cell opens the menu: share a region, share
+                   # a monitor by name, stop sharing, show and move the
+                   # webcam overlay, start and stop recording. Only the rows
+                   # that make sense for what it is doing are offered.
 
 # --- clock -----------------------------------------------------------------
 cell=clock
@@ -391,7 +412,7 @@ button7=cmus_control next
 #   (..) glues items together with no separator between them.
 #   names are cell names plus the built-ins "workspaces" and "mode".
 # ---------------------------------------------------------------------------
-bar={workspaces,mode||(cmus,cmusui),volume,(docker,mpv),clock,(cpu,temp),battery}
+bar={workspaces,mode||(cmus,cmusui),volume,(docker,mpv),vcam,clock,(cpu,temp),battery}
 
 # --- colors: #rrggbb or #rrggbbaa ------------------------------------------
 bg=26313fe6         # the bar itself

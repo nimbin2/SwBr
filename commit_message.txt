@@ -1,40 +1,23 @@
-swbr: a vcam cell — lamps on the strip, a menu on a click
+swbr: the vcam menu follows along, and its share rows toggle
 
-vcam is a virtual webcam: it loops the real camera through a filter and
-overlay chain and writes the result to a v4l2loopback device that browsers
-see as a camera. It listens on a unix socket and answers in lines.
+Cycling the webcam position needed the menu closed and reopened between
+every step. The menu was only rebuilt when a crude bitmask of the vcam state
+changed — running, recording, how many shares, webcam present — and moving
+an overlay changes none of those. So the row went on offering the move it
+had already made, and pressing it again sent the same command. The change
+check is a digest of everything the cell and the menu are drawn from now,
+overlay rectangles included, so the row updates in place and five presses
+walk the webcam round the frame.
 
-source=vcam asks that socket itself, the way source=cmus asks cmus, rather
-than running vcam-ctl on a timer — so whether it is up, what it is sharing
-and whether it is recording are facts rather than a guess at what a script
-printed. One connection a tick gets `list` and `record info`, non-blocking,
-on the tick the bar already has: a wedged vcam must not take the bar with
-it. The cell is not there at all while vcam is not running.
+The share rows are toggles. A share swbr starts gets an overlay id of its
+own — the monitor's name, or "region" — so the row that started it is the
+row that stops it: "share screen DP-1" becomes "stop sharing DP-1". The
+separate stop row is gone; one remains for shares none of those rows
+covers, started from the command line or elsewhere.
 
-Folded, a new slim mode: dots. Round lamps, one per thing that is on —
-green while vcam runs, a second red one while it is recording. slim_color2
-changes the red one.
-
-Clicking the cell opens a menu in the panel under the bar — the same strip
-of surface the calendar lives in, which already grows and already takes
-clicks. The rows are built from what vcam just said, so only what makes
-sense is offered: share a region, share a monitor by name (from sway's own
-output list), stop sharing when something is, show or hide the webcam
-overlay, move it on round the six positions, start or stop recording. A row
-lights up under the pointer, and the menu stays open while you work through
-it, because setting a share up is several of these in a row.
-
-Doing is not asking: the menu runs vcam-ctl. Picking a region needs slurp
-and sharing a whole monitor needs geometry and down-scaling it already gets
-right. src_path= finds it when it is not on $PATH.
-
-Also fixed, found on the way: a height change the resize throttle turned
-away was turned away for good. tip_h had already moved, so the caller never
-asked again and the panel stayed invisible — which is why a menu with seven
-rows would not open where one with five had. The bar remembers the refused
-fit and asks again next frame.
-
-The build id now covers sw_theme.h as well as swbr.c.
+The cell is blue in the advanced example — its own colour beside docker's
+green and the clock's cyan — and so is the running lamp on the strip. The
+recording lamp stays red.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01SuAfijAAYjLpcVwhCq3AF4

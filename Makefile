@@ -7,10 +7,12 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
 LDLIBS   = -lwayland-client -lm
 
-# short md5 of the sources, compiled in: `swbr --version` then tells you
-# exactly which build is running. The headers count too, so a fix in one of
-# them is a different build even when swbr.c has not moved.
-BUILD   := $(shell cat swbr.c sw_theme.h 2>/dev/null | md5sum | cut -c1-8)
+# short md5 of everything that ships, compiled in: `swbr --version` then
+# tells you exactly which drop is running. The headers count, and so do the
+# example configs — a cell added to one of those changes what you get even
+# though swbr.c has not moved.
+BUILD   := $(shell cat swbr.c sw_theme.h config.example config.advanced.example \
+                   2>/dev/null | md5sum | cut -c1-8)
 
 all: swbr
 
